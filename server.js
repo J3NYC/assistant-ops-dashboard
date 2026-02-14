@@ -10,12 +10,21 @@ const PORT = process.env.PORT || 3000;
 
 const ACCESS_TOKEN_TTL_SECONDS = 15 * 60; // 15 minutes
 const REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
+const SESSION_ABSOLUTE_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24h
+const SESSION_SLIDING_WINDOW_MS = 15 * 60 * 1000; // 15m
+const MAX_CONCURRENT_SESSIONS = 3;
+
 const JWT_ISSUER = process.env.JWT_ISSUER || "assistant-ops-dashboard";
 const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "assistant-ops-dashboard-api";
+const COOKIE_DOMAIN = process.env.AUTH_COOKIE_DOMAIN || undefined;
 
 const JWT_KEY_DIR = path.join(__dirname, "keys");
 const PRIVATE_KEY_PATH = path.join(JWT_KEY_DIR, "jwtRS256.key");
 const PUBLIC_KEY_PATH = path.join(JWT_KEY_DIR, "jwtRS256.key.pub");
+
+const ACCESS_COOKIE = "ops_access_token";
+const REFRESH_COOKIE = "ops_refresh_token";
+const SESSION_COOKIE = "ops_session_id";
 
 const ROLES = {
   owner: {
@@ -31,19 +40,13 @@ const ROLES = {
       "config:read",
       "models:all",
       "keys:rotate",
-      "users:read",
     ],
     models: ["*"],
     rateLimitPerMin: 60,
     dailyCostCap: 500,
   },
   developer: {
-    permissions: [
-      "dashboard:read",
-      "config:read",
-      "keys:own:rotate",
-      "models:limited",
-    ],
+    permissions: ["dashboard:read", "config:read", "keys:own:rotate", "models:limited"],
     models: ["claude-3-5-sonnet", "claude-3-5-haiku", "sonnet", "haiku"],
     rateLimitPerMin: 30,
     dailyCostCap: 100,
@@ -64,8 +67,6 @@ const ROLES = {
 
 const API_KEY_LIMITS = (() => {
   try {
-    // Example:
-    // {"ak_ops_default":{"models":["claude-3-5-haiku"],"rateLimitPerMin":25,"dailyCostCap":75}}
     const raw = process.env.API_KEY_RBAC_CONFIG;
     return raw ? JSON.parse(raw) : {};
   } catch {
@@ -73,7 +74,6 @@ const API_KEY_LIMITS = (() => {
   }
 })();
 
-// Demo users (replace with real DB)
 const usersById = new Map([
   [
     "u_owner",
@@ -83,7 +83,7 @@ const usersById = new Map([
       password: process.env.DASHBOARD_OWNER_PASSWORD || "change-me-now",
       role: "owner",
       disabled: false,
-      permissions: [],
+      assignedModels: ["*"],
     },
   ],
   [
@@ -94,7 +94,7 @@ const usersById = new Map([
       password: process.env.DASHBOARD_ADMIN_PASSWORD || "change-me-now",
       role: "admin",
       disabled: false,
-      permissions: [],
+      assignedModels: ["*"],
     },
   ],
   [
@@ -105,7 +105,7 @@ const usersById = new Map([
       password: process.env.DASHBOARD_DEVELOPER_PASSWORD || "change-me-now",
       role: "developer",
       disabled: false,
-      permissions: [],
+      assignedModels: ["sonnet", "haiku"],
     },
   ],
   [
@@ -116,9 +116,8 @@ const usersById = new Map([
       password: process.env.DASHBOARD_API_PASSWORD || "change-me-now",
       role: "api_consumer",
       apiKeyId: "ak_ops_default",
-      assignedModels: ["claude-3-5-haiku"],
       disabled: false,
-      permissions: [],
+      assignedModels: ["claude-3-5-haiku"],
     },
   ],
   [
@@ -129,15 +128,16 @@ const usersById = new Map([
       password: process.env.DASHBOARD_VIEWER_PASSWORD || "change-me-now",
       role: "viewer",
       disabled: false,
-      permissions: [],
+      assignedModels: [],
     },
   ],
 ]);
 const usersByUsername = new Map(Array.from(usersById.values()).map((u) => [u.username, u]));
 
-const refreshTokenStore = new Map(); // hash(token) -> { userId, expiresAtMs }
-const rateWindowStore = new Map(); // `${userId}:${minuteBucket}` -> count
-const dailyCostStore = new Map(); // `${userId}:${YYYY-MM-DD}` -> cost
+const sessionsById = new Map();
+const refreshTokenStore = new Map(); // hash(token) -> { userId, sessionId, expiresAtMs }
+const rateWindowStore = new Map();
+const dailyCostStore = new Map();
 
 app.use(express.json());
 
@@ -155,6 +155,59 @@ function getClientIp(req) {
     req.socket.remoteAddress ||
     "unknown"
   );
+}
+
+function getUserAgent(req) {
+  return req.headers["user-agent"] || "unknown";
+}
+
+function countryBucketFromIp(ip) {
+  const m = String(ip || "").match(/(\d+)\.(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return "unknown";
+  const first = Number(m[1]);
+  if (first <= 49) return "bucket-a";
+  if (first <= 99) return "bucket-b";
+  if (first <= 149) return "bucket-c";
+  if (first <= 199) return "bucket-d";
+  return "bucket-e";
+}
+
+function parseCookies(req) {
+  const raw = req.headers.cookie || "";
+  const out = {};
+  for (const part of raw.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx === -1) continue;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    if (!k) continue;
+    out[k] = decodeURIComponent(v);
+  }
+  return out;
+}
+
+function setAuthCookie(res, name, value, maxAgeSeconds) {
+  res.cookie(name, value, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "strict",
+    path: "/",
+    domain: COOKIE_DOMAIN,
+    maxAge: maxAgeSeconds * 1000,
+  });
+}
+
+function clearAuthCookies(res) {
+  const opts = {
+    httpOnly: true,
+    secure: true,
+    sameSite: "strict",
+    path: "/",
+    domain: COOKIE_DOMAIN,
+  };
+  res.clearCookie(ACCESS_COOKIE, opts);
+  res.clearCookie(REFRESH_COOKIE, opts);
+  res.clearCookie(SESSION_COOKIE, opts);
 }
 
 function logAuthFailure(req, reason) {
@@ -199,7 +252,8 @@ function ensureRsaKeys() {
 
   return { privateKey, publicKey, source: "generated" };
 }
-const keyMaterial = ensureRsaKeys();
+
+let keyMaterial = ensureRsaKeys();
 
 function roleExists(role) {
   return Object.prototype.hasOwnProperty.call(ROLES, role);
@@ -227,10 +281,11 @@ function getEffectiveRoleConfig(user) {
   };
 }
 
-function buildAccessToken(user) {
+function buildAccessToken(user, sessionId) {
   return jwt.sign(
     {
       sub: user.id,
+      sid: sessionId,
       role: user.role,
       permissions: getPermissionsForRole(user.role),
       type: "access",
@@ -246,14 +301,11 @@ function buildAccessToken(user) {
   );
 }
 
-function hashToken(token) {
-  return crypto.createHash("sha256").update(token).digest("hex");
-}
-
-function buildRefreshToken(user) {
-  const token = jwt.sign(
+function buildRefreshToken(user, sessionId) {
+  return jwt.sign(
     {
       sub: user.id,
+      sid: sessionId,
       role: user.role,
       permissions: getPermissionsForRole(user.role),
       type: "refresh",
@@ -268,13 +320,55 @@ function buildRefreshToken(user) {
       expiresIn: REFRESH_TOKEN_TTL_SECONDS,
     }
   );
+}
 
-  refreshTokenStore.set(hashToken(token), {
+function hashToken(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+function invalidateSession(sessionId) {
+  sessionsById.delete(sessionId);
+  for (const [k, v] of refreshTokenStore.entries()) {
+    if (v.sessionId === sessionId) refreshTokenStore.delete(k);
+  }
+}
+
+function invalidateAllSessionsForUser(userId) {
+  for (const [sid, s] of sessionsById.entries()) {
+    if (s.userId === userId) invalidateSession(sid);
+  }
+}
+
+function invalidateAllSessionsGlobal() {
+  sessionsById.clear();
+  refreshTokenStore.clear();
+}
+
+function pruneUserSessionsToLimit(userId) {
+  const userSessions = Array.from(sessionsById.values())
+    .filter((s) => s.userId === userId)
+    .sort((a, b) => a.createdAt - b.createdAt);
+  while (userSessions.length > MAX_CONCURRENT_SESSIONS) {
+    const oldest = userSessions.shift();
+    invalidateSession(oldest.id);
+  }
+}
+
+function createSession(req, user) {
+  const id = crypto.randomUUID();
+  const now = Date.now();
+  const session = {
+    id,
     userId: user.id,
-    expiresAtMs: Date.now() + REFRESH_TOKEN_TTL_SECONDS * 1000,
-  });
-
-  return token;
+    createdAt: now,
+    lastActivityAt: now,
+    ipAtCreation: getClientIp(req),
+    userAgentAtCreation: getUserAgent(req),
+    countryBucketAtCreation: countryBucketFromIp(getClientIp(req)),
+  };
+  sessionsById.set(id, session);
+  pruneUserSessionsToLimit(user.id);
+  return session;
 }
 
 function purgeExpiredRefreshTokens() {
@@ -284,8 +378,16 @@ function purgeExpiredRefreshTokens() {
   }
 }
 
+function isSessionExpired(session) {
+  const now = Date.now();
+  if (now - session.createdAt > SESSION_ABSOLUTE_TIMEOUT_MS) return true;
+  if (now - session.lastActivityAt > SESSION_SLIDING_WINDOW_MS) return true;
+  return false;
+}
+
 function send401(req, res, reason) {
   logAuthFailure(req, reason);
+  clearAuthCookies(res);
   return res.status(401).json({ error: { message: "Unauthorized", type: "unauthorized" } });
 }
 
@@ -295,9 +397,10 @@ function authMiddleware(req, res, next) {
     return next();
   }
 
-  const authHeader = req.headers.authorization || "";
-  const [scheme, token] = authHeader.split(" ");
-  if (scheme !== "Bearer" || !token) return send401(req, res, "missing_or_malformed_token");
+  const cookies = parseCookies(req);
+  const token = cookies[ACCESS_COOKIE];
+  const sessionIdCookie = cookies[SESSION_COOKIE];
+  if (!token || !sessionIdCookie) return send401(req, res, "missing_session_cookie");
 
   try {
     const payload = jwt.verify(token, keyMaterial.publicKey, {
@@ -307,16 +410,40 @@ function authMiddleware(req, res, next) {
     });
 
     if (payload.type !== "access") return send401(req, res, "invalid_token_type");
+    if (!payload.sid || payload.sid !== sessionIdCookie) return send401(req, res, "session_mismatch");
+
     const user = usersById.get(payload.sub);
     if (!user || user.disabled) return send401(req, res, "account_disabled_or_missing");
+
+    const session = sessionsById.get(payload.sid);
+    if (!session || session.userId !== user.id) return send401(req, res, "session_not_found");
+    if (isSessionExpired(session)) {
+      invalidateSession(session.id);
+      return send401(req, res, "session_expired");
+    }
+
+    const currentCountryBucket = countryBucketFromIp(getClientIp(req));
+    if (
+      currentCountryBucket !== "unknown" &&
+      session.countryBucketAtCreation !== "unknown" &&
+      currentCountryBucket !== session.countryBucketAtCreation
+    ) {
+      console.warn(
+        `[session-ip-alert] userId=${user.id} sessionId=${session.id} createdBucket=${session.countryBucketAtCreation} currentBucket=${currentCountryBucket} createdIp=${session.ipAtCreation} currentIp=${getClientIp(req)} ts=${new Date().toISOString()}`
+      );
+    }
+
+    session.lastActivityAt = Date.now();
 
     req.auth = {
       userId: user.id,
       role: payload.role,
       permissions: Array.isArray(payload.permissions) ? payload.permissions : [],
       apiKeyId: payload.apiKeyId,
+      sessionId: session.id,
     };
     req.user = user;
+    req.session = session;
     return next();
   } catch (err) {
     if (err?.name === "TokenExpiredError") return send401(req, res, "token_expired");
@@ -327,14 +454,8 @@ function authMiddleware(req, res, next) {
 function requirePermission(action) {
   return (req, res, next) => {
     const role = req.auth?.role;
-    const roleCfg = ROLES[role] || ROLES.viewer;
-    const perms = roleCfg.permissions || [];
-
-    if (perms.includes("*") || perms.includes(action)) {
-      req.action = action;
-      return next();
-    }
-
+    const perms = (ROLES[role] || ROLES.viewer).permissions || [];
+    if (perms.includes("*") || perms.includes(action)) return next();
     logAuthzFailure(req, action, "permission_denied");
     return res.status(403).json({ error: { message: "Forbidden", type: "forbidden" } });
   };
@@ -343,11 +464,8 @@ function requirePermission(action) {
 function requireAnyPermission(actions) {
   return (req, res, next) => {
     const role = req.auth?.role;
-    const roleCfg = ROLES[role] || ROLES.viewer;
-    const perms = roleCfg.permissions || [];
-
+    const perms = (ROLES[role] || ROLES.viewer).permissions || [];
     if (perms.includes("*") || actions.some((a) => perms.includes(a))) return next();
-
     logAuthzFailure(req, actions.join("|"), "permission_denied");
     return res.status(403).json({ error: { message: "Forbidden", type: "forbidden" } });
   };
@@ -384,12 +502,11 @@ function enforceRateAndCostLimits(action, resolveEstimatedCost = () => 0) {
 
 function enforceModelAccess(req, res, next) {
   const model = req.body?.model;
-  const action = "models:invoke";
-  const role = req.auth?.role;
   const cfg = getEffectiveRoleConfig(req.user);
+  const role = req.auth?.role;
 
   if (!model || typeof model !== "string") {
-    logAuthzFailure(req, action, "model_missing");
+    logAuthzFailure(req, "models:invoke", "model_missing");
     return res.status(400).json({ error: { message: "Model is required", type: "invalid_request" } });
   }
 
@@ -399,7 +516,7 @@ function enforceModelAccess(req, res, next) {
   );
 
   if (!allowed) {
-    logAuthzFailure(req, action, `model_denied:${model}`);
+    logAuthzFailure(req, "models:invoke", `model_denied:${model}`);
     return res
       .status(403)
       .json({ error: { message: "Your role does not have access to this model", type: "forbidden" } });
@@ -408,7 +525,7 @@ function enforceModelAccess(req, res, next) {
   return next();
 }
 
-app.use(authMiddleware); // auth first for protected routes
+app.use(authMiddleware);
 app.use(express.static(path.join(__dirname, "public"), { index: false }));
 
 app.get("/health", (_req, res) => {
@@ -424,24 +541,42 @@ app.post("/auth/login", (req, res) => {
     return res.status(401).json({ error: { message: "Unauthorized", type: "unauthorized" } });
   }
 
+  const session = createSession(req, user);
+  const accessToken = buildAccessToken(user, session.id);
+  const refreshToken = buildRefreshToken(user, session.id);
+  refreshTokenStore.set(hashToken(refreshToken), {
+    userId: user.id,
+    sessionId: session.id,
+    expiresAtMs: Date.now() + REFRESH_TOKEN_TTL_SECONDS * 1000,
+  });
+
+  setAuthCookie(res, ACCESS_COOKIE, accessToken, ACCESS_TOKEN_TTL_SECONDS);
+  setAuthCookie(res, REFRESH_COOKIE, refreshToken, REFRESH_TOKEN_TTL_SECONDS);
+  setAuthCookie(res, SESSION_COOKIE, session.id, REFRESH_TOKEN_TTL_SECONDS);
+
   return res.json({
-    accessToken: buildAccessToken(user),
-    accessTokenExpiresIn: ACCESS_TOKEN_TTL_SECONDS,
-    refreshToken: buildRefreshToken(user),
-    refreshTokenExpiresIn: REFRESH_TOKEN_TTL_SECONDS,
-    tokenType: "Bearer",
+    ok: true,
+    message: "Login successful",
+    sessionId: session.id,
+    role: user.role,
+    expiresIn: ACCESS_TOKEN_TTL_SECONDS,
   });
 });
 
 app.post("/auth/refresh", (req, res) => {
   purgeExpiredRefreshTokens();
-  const { refreshToken } = req.body || {};
-  if (!refreshToken || typeof refreshToken !== "string") {
+  const cookies = parseCookies(req);
+  const refreshToken = cookies[REFRESH_COOKIE];
+  const sessionId = cookies[SESSION_COOKIE];
+  if (!refreshToken || !sessionId) {
+    clearAuthCookies(res);
     return res.status(401).json({ error: { message: "Unauthorized", type: "unauthorized" } });
   }
 
   const tokenHash = hashToken(refreshToken);
-  if (!refreshTokenStore.has(tokenHash)) {
+  const rec = refreshTokenStore.get(tokenHash);
+  if (!rec || rec.sessionId !== sessionId) {
+    clearAuthCookies(res);
     return res.status(401).json({ error: { message: "Unauthorized", type: "unauthorized" } });
   }
 
@@ -452,30 +587,89 @@ app.post("/auth/refresh", (req, res) => {
       audience: JWT_AUDIENCE,
     });
 
-    if (payload.type !== "refresh") {
+    if (payload.type !== "refresh" || payload.sid !== sessionId) {
       refreshTokenStore.delete(tokenHash);
+      clearAuthCookies(res);
       return res.status(401).json({ error: { message: "Unauthorized", type: "unauthorized" } });
     }
 
     const user = usersById.get(payload.sub);
-    if (!user || user.disabled) {
+    const session = sessionsById.get(sessionId);
+    if (!user || user.disabled || !session || session.userId !== user.id || isSessionExpired(session)) {
       refreshTokenStore.delete(tokenHash);
+      if (session) invalidateSession(session.id);
+      clearAuthCookies(res);
       return res.status(401).json({ error: { message: "Unauthorized", type: "unauthorized" } });
     }
 
-    refreshTokenStore.delete(tokenHash); // rotate one-time use immediately
+    refreshTokenStore.delete(tokenHash); // one-time-use rotation
 
-    return res.json({
-      accessToken: buildAccessToken(user),
-      accessTokenExpiresIn: ACCESS_TOKEN_TTL_SECONDS,
-      refreshToken: buildRefreshToken(user),
-      refreshTokenExpiresIn: REFRESH_TOKEN_TTL_SECONDS,
-      tokenType: "Bearer",
+    const newAccess = buildAccessToken(user, session.id);
+    const newRefresh = buildRefreshToken(user, session.id);
+    refreshTokenStore.set(hashToken(newRefresh), {
+      userId: user.id,
+      sessionId: session.id,
+      expiresAtMs: Date.now() + REFRESH_TOKEN_TTL_SECONDS * 1000,
     });
+
+    session.lastActivityAt = Date.now();
+
+    setAuthCookie(res, ACCESS_COOKIE, newAccess, ACCESS_TOKEN_TTL_SECONDS);
+    setAuthCookie(res, REFRESH_COOKIE, newRefresh, REFRESH_TOKEN_TTL_SECONDS);
+    setAuthCookie(res, SESSION_COOKIE, session.id, REFRESH_TOKEN_TTL_SECONDS);
+
+    return res.json({ ok: true, message: "Token refreshed" });
   } catch {
     refreshTokenStore.delete(tokenHash);
+    clearAuthCookies(res);
     return res.status(401).json({ error: { message: "Unauthorized", type: "unauthorized" } });
   }
+});
+
+app.get("/auth/sessions", (req, res) => {
+  const out = Array.from(sessionsById.values())
+    .filter((s) => s.userId === req.auth.userId)
+    .map((s) => ({
+      id: s.id,
+      userId: s.userId,
+      createdAt: new Date(s.createdAt).toISOString(),
+      lastActivityAt: new Date(s.lastActivityAt).toISOString(),
+      ipAtCreation: s.ipAtCreation,
+      userAgentAtCreation: s.userAgentAtCreation,
+    }));
+  res.json({ sessions: out });
+});
+
+app.delete("/auth/sessions/:id", (req, res) => {
+  const sid = req.params.id;
+  const target = sessionsById.get(sid);
+  if (!target || target.userId !== req.auth.userId) {
+    return res.status(404).json({ error: { message: "Session not found", type: "not_found" } });
+  }
+  invalidateSession(sid);
+  if (req.auth.sessionId === sid) clearAuthCookies(res);
+  return res.json({ ok: true, revokedSessionId: sid });
+});
+
+app.delete("/auth/sessions", (req, res) => {
+  invalidateAllSessionsForUser(req.auth.userId);
+  clearAuthCookies(res);
+  return res.json({ ok: true, message: "All sessions revoked" });
+});
+
+app.post("/auth/password", (req, res) => {
+  const { currentPassword, newPassword } = req.body || {};
+  const user = req.user;
+  if (!currentPassword || user.password !== currentPassword) {
+    return res.status(403).json({ error: { message: "Forbidden", type: "forbidden" } });
+  }
+  if (!newPassword || String(newPassword).length < 8) {
+    return res.status(400).json({ error: { message: "Invalid password", type: "invalid_request" } });
+  }
+  user.password = String(newPassword);
+  invalidateAllSessionsForUser(user.id);
+  clearAuthCookies(res);
+  return res.json({ ok: true, message: "Password changed. All sessions invalidated." });
 });
 
 app.get(
@@ -493,11 +687,7 @@ app.get(
   enforceRateAndCostLimits("dashboard:read"),
   async (_req, res) => {
     const status = await run("openclaw status");
-    res.json({
-      timestamp: new Date().toISOString(),
-      openclaw: status.ok ? "up" : "down",
-      raw: status.output,
-    });
+    res.json({ timestamp: new Date().toISOString(), openclaw: status.ok ? "up" : "down", raw: status.output });
   }
 );
 
@@ -507,28 +697,17 @@ app.post(
   enforceRateAndCostLimits("gateway:restart"),
   async (_req, res) => {
     const restart = await run("openclaw gateway restart");
-    res.json({
-      success: restart.ok,
-      message: restart.ok ? "Gateway restarted" : "Restart failed",
-      raw: restart.output,
-    });
+    res.json({ success: restart.ok, message: restart.ok ? "Gateway restarted" : "Restart failed", raw: restart.output });
   }
 );
 
-// Example model invocation endpoint to enforce model-tier RBAC before external call
 app.post(
   "/api/models/invoke",
   requireAnyPermission(["models:all", "models:limited", "models:key-assigned"]),
   enforceRateAndCostLimits("models:invoke", (req) => req.body?.estimatedCost || 0),
   enforceModelAccess,
   async (req, res) => {
-    // RBAC + model checks are complete at this point.
-    // Business logic / external provider call would happen here.
-    return res.json({
-      ok: true,
-      model: req.body.model,
-      message: "Model call permitted and would execute now.",
-    });
+    return res.json({ ok: true, model: req.body.model, message: "Model call permitted and would execute now." });
   }
 );
 
@@ -555,20 +734,34 @@ app.post(
   (req, res) => {
     const { id } = req.params;
     const { role } = req.body || {};
-
     if (!roleExists(role)) {
       return res.status(400).json({ error: { message: "Invalid role", type: "invalid_request" } });
     }
-
     const user = usersById.get(id);
     if (!user) {
       return res.status(404).json({ error: { message: "User not found", type: "not_found" } });
     }
-
     user.role = role;
-    user.permissions = getPermissionsForRole(role);
-
     return res.json({ ok: true, user: { id: user.id, username: user.username, role: user.role } });
+  }
+);
+
+app.post(
+  "/admin/keys/rotate",
+  requirePermission("keys:rotate"),
+  enforceRateAndCostLimits("keys:rotate"),
+  (_req, res) => {
+    fs.mkdirSync(JWT_KEY_DIR, { recursive: true });
+    const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    fs.writeFileSync(PRIVATE_KEY_PATH, privateKey, { mode: 0o600 });
+    fs.writeFileSync(PUBLIC_KEY_PATH, publicKey, { mode: 0o644 });
+    keyMaterial = { privateKey, publicKey, source: "rotated" };
+    invalidateAllSessionsGlobal();
+    return res.json({ ok: true, message: "Keys rotated. All sessions invalidated." });
   }
 );
 
