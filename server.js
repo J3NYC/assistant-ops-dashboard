@@ -80,6 +80,7 @@ const ADMIN_RECOGNIZED_IPS = String(process.env.ADMIN_RECOGNIZED_IPS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+const LARGE_RESPONSE_BYTES = Number(process.env.LARGE_RESPONSE_BYTES || 200000);
 
 const MAX_INPUT_LENGTH = 4000;
 const MAX_TURNS = 50;
@@ -584,6 +585,27 @@ async function evaluateCircuitBreaker(modelName) {
   const spend = Number(snapshot.global || 0);
   const manualResetRequired = await isEmergencyManualResetRequired();
 
+  await redisFailOpen(async () => {
+    const prevDays = Array.from({ length: 7 }, (_, i) => {
+      const d = new Date(Date.now() - (i + 1) * 86400000).toISOString().slice(0, 10);
+      return rlKey(`cost:day:${d}:global`);
+    });
+    const vals = await Promise.all(prevDays.map((k) => redisClient.get(k)));
+    const nums = vals.map((v) => Number(v || 0)).filter((n) => n > 0);
+    const avg7 = nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : 0;
+    if (avg7 > 0 && spend > avg7 * 3) {
+      await sendCircuitBreakerAlert("high", "Cost anomaly: spend > 3x rolling 7-day average", { spend, avg7 });
+      const incident = pushIncident({
+        type: "cost_anomaly",
+        severity: "high",
+        summary: "Spend exceeded 3x rolling 7-day average",
+        details: { spend, avg7 },
+      });
+      addIncidentTimeline(incident.id, "response", "soft_breaker_review_triggered");
+    }
+    return true;
+  }, false);
+
   if (manualResetRequired) {
     return { action: "suspend_all", limits, snapshot, reason: "manual_reset_required" };
   }
@@ -784,6 +806,7 @@ async function promptInjectionDefense(req, res, next) {
 
 app.use((req, res, next) => {
   req.requestId = req.headers["x-request-id"] || crypto.randomUUID();
+  req._startHr = process.hrtime.bigint();
   res.setHeader("X-Request-Id", req.requestId);
   next();
 });
@@ -815,6 +838,8 @@ app.use((req, res, next) => {
     const minuteBucket = Math.floor(Date.now() / 60000);
     const totalKey = rlKey(`errrate:total:${minuteBucket}`);
     const errKey = rlKey(`errrate:error:${minuteBucket}`);
+    const latencyMs = Number((process.hrtime.bigint() - (req._startHr || process.hrtime.bigint())) / 1000000n);
+    const respLen = Number(res.getHeader("Content-Length") || 0);
 
     await redisFailOpen(async () => {
       await redisClient.incr(totalKey);
@@ -823,6 +848,13 @@ app.use((req, res, next) => {
         await redisClient.incr(errKey);
         await redisClient.expire(errKey, 10 * 60);
       }
+
+      const latKey = rlKey(`latency:sum:${minuteBucket}`);
+      const latCountKey = rlKey(`latency:count:${minuteBucket}`);
+      await redisClient.incrBy(latKey, Math.max(0, latencyMs));
+      await redisClient.expire(latKey, 10 * 60);
+      await redisClient.incr(latCountKey);
+      await redisClient.expire(latCountKey, 10 * 60);
 
       const buckets = Array.from({ length: 5 }, (_, i) => minuteBucket - i);
       const totals = await Promise.all(buckets.map((b) => redisClient.get(rlKey(`errrate:total:${b}`))));
@@ -833,17 +865,45 @@ app.use((req, res, next) => {
         await sendCircuitBreakerAlert("high", "Error rate >10% over 5 minutes", { total5, err5, ratio: err5 / total5 });
         structuredLog("error", "security", "error_rate_spike", { total5, err5, ratio: err5 / total5 }, req);
       }
+
+      const latSums = await Promise.all(buckets.map((b) => redisClient.get(rlKey(`latency:sum:${b}`))));
+      const latCounts = await Promise.all(buckets.map((b) => redisClient.get(rlKey(`latency:count:${b}`))));
+      const sum5 = latSums.reduce((a, v) => a + Number(v || 0), 0);
+      const cnt5 = latCounts.reduce((a, v) => a + Number(v || 0), 0);
+      const avgLat = cnt5 ? sum5 / cnt5 : 0;
+      if (cnt5 >= 20 && avgLat > 5000) {
+        await sendCircuitBreakerAlert("high", "Service degradation detected (avg latency >5s)", { avgLatencyMs: avgLat, sampleCount: cnt5 });
+        structuredLog("error", "security", "latency_degradation", { avg_latency_ms: avgLat, sample_count: cnt5 }, req);
+      }
       return true;
     }, false);
+
+    if (respLen > LARGE_RESPONSE_BYTES) {
+      const incident = pushIncident({
+        type: "data_exfiltration_attempt",
+        severity: "high",
+        summary: "Unusually large response detected",
+        details: { endpoint: req.path, responseBytes: respLen, ip: getClientIp(req) },
+      });
+      addIncidentTimeline(incident.id, "response", "logged_for_review");
+      structuredLog("warn", "security", "large_response_detected", { endpoint: req.path, response_bytes: respLen }, req);
+    }
 
     if (res.statusCode >= 500) {
       structuredLog("error", "api", "request_error", {
         endpoint: req.path,
         status: res.statusCode,
+        latency_ms: latencyMs,
       }, req);
     }
   });
   next();
+});
+
+app.use((req, res, next) => {
+  if (!killSwitchState.enabled) return next();
+  if (req.path.startsWith("/admin/killswitch") || req.path === "/health" || req.path === "/login") return next();
+  return res.status(503).json({ error: { message: "Service temporarily suspended", type: "service_unavailable" } });
 });
 
 app.use((req, res, next) => {
@@ -1081,6 +1141,9 @@ function getUserAgent(req) {
 
 fs.mkdirSync(LOG_DIR, { recursive: true });
 const inMemoryLogs = [];
+const inMemoryIncidents = [];
+let captchaRequired = false;
+let killSwitchState = { enabled: false, activatedAt: null, activatedBy: null };
 
 function maskUserId(userId) {
   const s = String(userId || "");
@@ -1139,6 +1202,38 @@ function structuredLog(level, category, event, metadata = {}, req = null) {
 
   if (["critical", "error"].includes(level)) forwardLogIfConfigured(entry);
   return entry;
+}
+
+function pushIncident(incident) {
+  const entry = {
+    id: incident.id || crypto.randomUUID(),
+    detectedAt: new Date().toISOString(),
+    status: "open",
+    timeline: [],
+    ...incident,
+  };
+  entry.timeline.push({ at: entry.detectedAt, event: "detected", detail: incident.summary || incident.type });
+  inMemoryIncidents.push(entry);
+  if (inMemoryIncidents.length > 2000) inMemoryIncidents.shift();
+  structuredLog("critical", "security", "incident_detected", { incident_id: entry.id, type: entry.type, summary: entry.summary });
+  return entry;
+}
+
+function addIncidentTimeline(incidentId, event, detail) {
+  const inc = inMemoryIncidents.find((x) => x.id === incidentId);
+  if (!inc) return;
+  inc.timeline.push({ at: new Date().toISOString(), event, detail });
+}
+
+function resolveIncident(incidentId, notes, resolver) {
+  const inc = inMemoryIncidents.find((x) => x.id === incidentId);
+  if (!inc) return null;
+  inc.status = "resolved";
+  inc.resolvedAt = new Date().toISOString();
+  inc.resolutionNotes = notes || "";
+  inc.resolvedBy = resolver || "unknown";
+  addIncidentTimeline(incidentId, "resolved", notes || "resolved");
+  return inc;
 }
 
 function normalizeIp(ip) {
@@ -1288,10 +1383,42 @@ async function logAuthFailure(req, reason, attemptedUsername = "") {
   }, 0);
 
   if (Number(escalation.value || 0) >= 10) {
+    await redisFailOpen(async () => {
+      await redisClient.setEx(rlKey(`block:${ip}`), 24 * 60 * 60, "1");
+      const dkey = rlKey("authfail:ips:5m");
+      await redisClient.zAdd(dkey, [{ score: Date.now(), value: `${ip}` }]);
+      await redisClient.zRemRangeByScore(dkey, 0, Date.now() - 5 * 60_000);
+      await redisClient.pExpire(dkey, 5 * 60_000);
+      return true;
+    }, false);
+
     await sendCircuitBreakerAlert("critical", "10+ failed logins from same IP in 5 minutes", {
       ip,
       failedLogins5m: escalation.value,
+      action: "ip_block_24h",
     });
+
+    const incident = pushIncident({
+      type: "brute_force",
+      severity: "critical",
+      summary: "Brute force login attack detected",
+      details: { ip, failedLogins5m: escalation.value, action: "ip_block_24h" },
+    });
+
+    const distributed = await redisFailOpen(async () => {
+      const vals = await redisClient.zRange(rlKey("authfail:ips:5m"), 0, -1);
+      const uniq = new Set(vals.map((v) => String(v)));
+      return uniq.size;
+    }, 0);
+
+    if (Number(distributed.value || 0) >= 5) {
+      captchaRequired = true;
+      addIncidentTimeline(incident.id, "response", "captcha_enabled_on_login");
+      await sendCircuitBreakerAlert("critical", "Distributed brute force detected (5+ IPs), CAPTCHA enabled", {
+        uniqueIps5m: distributed.value,
+      });
+    }
+
     structuredLog("critical", "security", "failed_login_burst", { ip, failedLogins5m: escalation.value }, req);
   }
 }
@@ -1488,7 +1615,7 @@ function send401(req, res, reason) {
   return res.status(401).json({ error: { message: "Unauthorized", type: "unauthorized" } });
 }
 
-function authMiddleware(req, res, next) {
+async function authMiddleware(req, res, next) {
   if (req.method === "GET" && (req.path === "/health" || req.path === "/login")) return next();
   if (req.method === "POST" && (req.path === "/auth/login" || req.path === "/auth/refresh" || req.path.startsWith("/webhooks/"))) {
     return next();
@@ -1525,9 +1652,35 @@ function authMiddleware(req, res, next) {
       session.countryBucketAtCreation !== "unknown" &&
       currentCountryBucket !== session.countryBucketAtCreation
     ) {
-      console.warn(
-        `[session-ip-alert] userId=${user.id} sessionId=${session.id} createdBucket=${session.countryBucketAtCreation} currentBucket=${currentCountryBucket} createdIp=${session.ipAtCreation} currentIp=${getClientIp(req)} ts=${new Date().toISOString()}`
-      );
+      structuredLog("critical", "security", "api_key_compromise_suspected", {
+        user_id: user.id,
+        session_id: session.id,
+        created_bucket: session.countryBucketAtCreation,
+        current_bucket: currentCountryBucket,
+        created_ip: session.ipAtCreation,
+        current_ip: getClientIp(req),
+      }, req);
+
+      if (user.apiKeyId) {
+        user.disabled = true;
+        await redisFailOpen(async () => {
+          await redisClient.setEx(rlKey(`block:${getClientIp(req)}`), 24 * 60 * 60, "1");
+          return true;
+        }, false);
+        const incident = pushIncident({
+          type: "api_key_compromise",
+          severity: "critical",
+          summary: "API key compromise suspected from unusual geography",
+          details: { userId: user.id, apiKeyId: user.apiKeyId, currentIp: getClientIp(req) },
+        });
+        addIncidentTimeline(incident.id, "response", "api_key_disabled");
+        addIncidentTimeline(incident.id, "response", "source_ip_blocked_24h");
+        await sendCircuitBreakerAlert("critical", "API key compromise suspected: key disabled and IP blocked", {
+          apiKey: maskApiKey(user.apiKeyId),
+          user: maskUserId(user.id),
+          ip: getClientIp(req),
+        });
+      }
     }
 
     session.lastActivityAt = Date.now();
@@ -1828,6 +1981,12 @@ app.post("/webhooks/:source", express.raw({ type: "*/*" }), (req, res) => {
 app.post("/auth/login", async (req, res) => {
   purgeExpiredRefreshTokens();
   const { username, password } = req.body || {};
+
+  if (captchaRequired && String(req.body?.captchaToken || "") !== String(process.env.LOGIN_CAPTCHA_BYPASS_TOKEN || "letmein-captcha")) {
+    await logAuthFailure(req, "captcha_required", String(username || ""));
+    return res.status(403).json({ error: { message: "CAPTCHA required", type: "forbidden" } });
+  }
+
   const user = usersByUsername.get(username);
 
   if (!user || user.password !== password || user.disabled) {
@@ -2234,6 +2393,73 @@ app.get(
     }
 
     return res.json({ count: logs.length, logs: logs.slice(-500) });
+  }
+);
+
+app.get(
+  "/admin/incidents",
+  requirePermission("dashboard:read"),
+  enforceRateAndCostLimits("dashboard:read"),
+  (req, res) => {
+    if (!["admin", "owner"].includes(String(req.auth?.role || ""))) {
+      return res.status(403).json({ error: { message: "Forbidden", type: "forbidden" } });
+    }
+    return res.json({ incidents: inMemoryIncidents.slice(-500) });
+  }
+);
+
+app.get(
+  "/admin/incidents/:id",
+  requirePermission("dashboard:read"),
+  enforceRateAndCostLimits("dashboard:read"),
+  (req, res) => {
+    if (!["admin", "owner"].includes(String(req.auth?.role || ""))) {
+      return res.status(403).json({ error: { message: "Forbidden", type: "forbidden" } });
+    }
+    const incident = inMemoryIncidents.find((x) => x.id === req.params.id);
+    if (!incident) return res.status(404).json({ error: { message: "Incident not found", type: "not_found" } });
+    return res.json({ incident });
+  }
+);
+
+app.post(
+  "/admin/incidents/:id/resolve",
+  requirePermission("dashboard:read"),
+  enforceRateAndCostLimits("dashboard:read"),
+  (req, res) => {
+    if (!["admin", "owner"].includes(String(req.auth?.role || ""))) {
+      return res.status(403).json({ error: { message: "Forbidden", type: "forbidden" } });
+    }
+    const incident = resolveIncident(req.params.id, req.body?.notes || "", req.auth?.userId);
+    if (!incident) return res.status(404).json({ error: { message: "Incident not found", type: "not_found" } });
+    structuredLog("info", "admin", "incident_resolved", { incident_id: incident.id, user_id: req.auth?.userId }, req);
+    return res.json({ ok: true, incident });
+  }
+);
+
+app.post(
+  "/admin/killswitch",
+  requireOwner,
+  enforceRateAndCostLimits("users:manage"),
+  (req, res) => {
+    if (String(req.body?.confirm || "") !== "ACTIVATE") {
+      return res.status(400).json({ error: { message: "Confirmation required", type: "invalid_request" } });
+    }
+    killSwitchState = { enabled: true, activatedAt: new Date().toISOString(), activatedBy: req.auth?.userId || "unknown" };
+    structuredLog("critical", "admin", "killswitch_activated", { user_id: req.auth?.userId, ip: getClientIp(req) }, req);
+    pushIncident({ type: "killswitch", severity: "critical", summary: "Kill switch activated", details: { by: req.auth?.userId, ip: getClientIp(req) } });
+    return res.json({ ok: true, state: killSwitchState });
+  }
+);
+
+app.post(
+  "/admin/killswitch/release",
+  requireOwner,
+  enforceRateAndCostLimits("users:manage"),
+  (req, res) => {
+    killSwitchState = { enabled: false, activatedAt: null, activatedBy: null };
+    structuredLog("critical", "admin", "killswitch_released", { user_id: req.auth?.userId, ip: getClientIp(req) }, req);
+    return res.json({ ok: true, state: killSwitchState });
   }
 );
 

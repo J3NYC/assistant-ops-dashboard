@@ -109,6 +109,23 @@ Admin endpoints:
 - `PUT /admin/costs/limits` (owner only)
 - `GET /admin/logs` (admin/owner; filter by `category`, `level`, `since`, `until`, `q`)
 - `GET /admin/logs/digest` (daily medium-severity summaries)
+- `GET /admin/incidents` / `GET /admin/incidents/:id` / `POST /admin/incidents/:id/resolve`
+- `POST /admin/killswitch` / `POST /admin/killswitch/release` (owner only)
+
+### Automated incident response
+
+Detections:
+- API key compromise signals (unusual IP/geography)
+- Brute force attacks (10+ failed logins in 5 min)
+- Cost anomaly (>3x rolling 7-day average)
+- Data exfiltration signal (large responses)
+- Service degradation (error rate >10%, latency >5s avg)
+
+Automatic responses include:
+- key disable + source IP block for compromise
+- 24h IP block for brute force (+ CAPTCHA if distributed)
+- circuit breaker escalation and model downgrades for cost anomalies
+- incident timeline creation for every incident
 
 ### Structured security logging
 
