@@ -229,17 +229,32 @@ function classifyFailureFromLog(logText = "") {
     },
   ];
 
+  let best = null;
   for (const c of categories) {
-    const matched = c.patterns.find((p) => log.includes(p));
-    if (matched) {
-      return { category: c.category, hint: c.hint, matchedPattern: matched };
+    const matches = c.patterns.filter((p) => log.includes(p));
+    if (!matches.length) continue;
+    if (!best || matches.length > best.matches.length) {
+      best = { ...c, matches };
     }
+  }
+
+  if (best) {
+    const confidence = Math.min(0.95, 0.4 + best.matches.length * 0.12);
+    return {
+      category: best.category,
+      hint: best.hint,
+      matchedPattern: best.matches[0],
+      confidence,
+      severity: confidence >= 0.75 ? "high" : confidence >= 0.55 ? "medium" : "low",
+    };
   }
 
   return {
     category: "unknown",
     hint: "No strong signal found. Open failed logs and inspect first error stack trace.",
     matchedPattern: null,
+    confidence: 0.25,
+    severity: "low",
   };
 }
 
@@ -873,6 +888,8 @@ app.get(
         failureCategory: classification.category,
         fixHint: classification.hint,
         matchedPattern: classification.matchedPattern,
+        confidence: classification.confidence,
+        severity: classification.severity,
         logSnippet,
       });
     }

@@ -9,6 +9,10 @@
     .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
     ul { padding-left: 1.2rem; }
     code { background: #f4f4f4; padding: 0.1rem 0.3rem; border-radius: 4px; }
+    .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; font-size: 0.82rem; font-weight: 600; }
+    .sev-high { background: #ffe3e3; color: #a40000; }
+    .sev-medium { background: #fff4d6; color: #8a5a00; }
+    .sev-low { background: #e8f5e9; color: #1f6d2e; }
   </style>
 </head>
 <body>
@@ -72,10 +76,14 @@
             : '';
           const category = escapeHtml(f.failureCategory || 'unknown');
           const hint = escapeHtml(f.fixHint || 'No hint available');
+          const confidenceNum = Number(f.confidence || 0);
+          const confidencePct = `${Math.round(confidenceNum * 100)}%`;
+          const severity = (f.severity || 'low').toLowerCase();
+          const severityClass = severity === 'high' ? 'sev-high' : severity === 'medium' ? 'sev-medium' : 'sev-low';
           const snippet = escapeHtml(f.logSnippet || '').slice(0, 350);
           const snippetHtml = snippet ? `<br/><details><summary>Failed log excerpt</summary><pre style="white-space: pre-wrap; background: #f8f8f8; padding: 0.5rem; border-radius: 6px;">${snippet}</pre></details>` : '';
 
-          return `<li><strong>${escapeHtml(f.workflow)}</strong>: ${escapeHtml(f.title)}<br/>Branch: <code>${escapeHtml(f.branch)}</code> · SHA: <code>${sha}</code><br/>Why it failed: ${reason}${topFailuresHtml}<br/>Category: <code>${category}</code><br/>Hint: ${hint}${snippetHtml}<br/><a href="${escapeHtml(f.url)}" target="_blank" rel="noreferrer">Open run</a></li>`;
+          return `<li><strong>${escapeHtml(f.workflow)}</strong>: ${escapeHtml(f.title)}<br/>Branch: <code>${escapeHtml(f.branch)}</code> · SHA: <code>${sha}</code><br/>Why it failed: ${reason}${topFailuresHtml}<br/>Category: <code>${category}</code> · Confidence: <code>${escapeHtml(confidencePct)}</code> · <span class="badge ${severityClass}">${escapeHtml(severity.toUpperCase())}</span><br/>Hint: ${hint}${snippetHtml}<br/><a href="${escapeHtml(f.url)}" target="_blank" rel="noreferrer">Open run</a></li>`;
         }).join('');
       } catch (err) {
         statusEl.textContent = 'Request failed. Check server logs.';
