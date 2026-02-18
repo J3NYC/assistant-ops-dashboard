@@ -17,6 +17,7 @@ const MAX_CONCURRENT_SESSIONS = 3;
 const JWT_ISSUER = process.env.JWT_ISSUER || "assistant-ops-dashboard";
 const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "assistant-ops-dashboard-api";
 const COOKIE_DOMAIN = process.env.AUTH_COOKIE_DOMAIN || undefined;
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 const JWT_KEY_DIR = path.join(__dirname, "keys");
 const PRIVATE_KEY_PATH = path.join(JWT_KEY_DIR, "jwtRS256.key");
@@ -304,7 +305,7 @@ function parseCookies(req) {
 function setAuthCookie(res, name, value, maxAgeSeconds) {
   res.cookie(name, value, {
     httpOnly: true,
-    secure: true,
+    secure: IS_PRODUCTION,
     sameSite: "strict",
     path: "/",
     domain: COOKIE_DOMAIN,
@@ -315,7 +316,7 @@ function setAuthCookie(res, name, value, maxAgeSeconds) {
 function clearAuthCookies(res) {
   const opts = {
     httpOnly: true,
-    secure: true,
+    secure: IS_PRODUCTION,
     sameSite: "strict",
     path: "/",
     domain: COOKIE_DOMAIN,
