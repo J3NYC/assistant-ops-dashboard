@@ -149,6 +149,20 @@ function run(cmd) {
   });
 }
 
+async function runJson(cmd) {
+  const result = await run(cmd);
+  if (!result.ok) return { ok: false, error: result.output };
+  try {
+    return { ok: true, data: JSON.parse(result.output || "null") };
+  } catch {
+    return { ok: false, error: `Invalid JSON from command: ${cmd}` };
+  }
+}
+
+function isValidRepoName(repo) {
+  return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(repo || ""));
+}
+
 function getClientIp(req) {
   return (
     req.headers["x-forwarded-for"]?.toString().split(",")[0].trim() ||
@@ -688,6 +702,61 @@ app.get(
   async (_req, res) => {
     const status = await run("openclaw status");
     res.json({ timestamp: new Date().toISOString(), openclaw: status.ok ? "up" : "down", raw: status.output });
+  }
+);
+
+app.get(
+  "/api/ci/failures",
+  requirePermission("dashboard:read"),
+  enforceRateAndCostLimits("dashboard:read"),
+  async (req, res) => {
+    const repo = String(req.query.repo || "").trim();
+    const limit = Math.min(Math.max(Number(req.query.limit || 5), 1), 10);
+
+    if (!isValidRepoName(repo)) {
+      return res.status(400).json({
+        error: {
+          message: "Invalid repo. Use owner/repo format.",
+          type: "invalid_request",
+        },
+      });
+    }
+
+    const list = await runJson(
+      `gh run list --repo ${repo} --status failure --limit ${limit} --json databaseId,workflowName,displayTitle,headBranch,event,startedAt,updatedAt,url,headSha`
+    );
+
+    if (!list.ok) {
+      return res.status(502).json({
+        error: {
+          message: "Failed to fetch CI runs via GitHub CLI",
+          type: "upstream_error",
+          detail: list.error,
+        },
+      });
+    }
+
+    const failures = Array.isArray(list.data) ? list.data : [];
+
+    const summaries = failures.map((run) => ({
+      runId: run.databaseId,
+      workflow: run.workflowName,
+      title: run.displayTitle,
+      branch: run.headBranch,
+      event: run.event,
+      sha: run.headSha,
+      startedAt: run.startedAt,
+      updatedAt: run.updatedAt,
+      url: run.url,
+      summary: `${run.workflowName || "Workflow"} failed on ${run.headBranch || "unknown-branch"} (${(run.headSha || "").slice(0, 7) || "unknown-sha"})`,
+    }));
+
+    return res.json({
+      repo,
+      count: summaries.length,
+      generatedAt: new Date().toISOString(),
+      failures: summaries,
+    });
   }
 );
 

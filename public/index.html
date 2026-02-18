@@ -3,8 +3,76 @@
 <head>
   <meta charset="UTF-8" />
   <title>Assistant Ops Dashboard</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.4; }
+    input, button { font-size: 1rem; padding: 0.5rem; }
+    .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+    ul { padding-left: 1.2rem; }
+    code { background: #f4f4f4; padding: 0.1rem 0.3rem; border-radius: 4px; }
+  </style>
 </head>
 <body>
-  <h1>Assistant Ops Dashboard is running ✅</h1>
+  <h1>Assistant Ops Dashboard</h1>
+  <p>CI Failure Summarizer (GitHub Actions)</p>
+
+  <div class="row">
+    <input id="repo" type="text" placeholder="owner/repo" value="" />
+    <button id="load">Load failures</button>
+  </div>
+
+  <p id="status"></p>
+  <ul id="results"></ul>
+
+  <script>
+    const repoInput = document.getElementById('repo');
+    const loadBtn = document.getElementById('load');
+    const statusEl = document.getElementById('status');
+    const resultsEl = document.getElementById('results');
+
+    function escapeHtml(str) {
+      return String(str || '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+    }
+
+    async function loadFailures() {
+      const repo = repoInput.value.trim();
+      resultsEl.innerHTML = '';
+      statusEl.textContent = 'Loading...';
+      if (!repo) {
+        statusEl.textContent = 'Enter a repo as owner/repo.';
+        return;
+      }
+
+      try {
+        const res = await fetch(`/api/ci/failures?repo=${encodeURIComponent(repo)}&limit=5`);
+        const data = await res.json();
+
+        if (!res.ok) {
+          statusEl.textContent = data?.error?.message || 'Failed to load failures.';
+          return;
+        }
+
+        statusEl.textContent = `${data.count} recent failed run(s) for ${data.repo}`;
+
+        if (!data.failures.length) {
+          resultsEl.innerHTML = '<li>No failed runs found 🎉</li>';
+          return;
+        }
+
+        resultsEl.innerHTML = data.failures.map((f) => {
+          const sha = escapeHtml((f.sha || '').slice(0, 7));
+          return `<li><strong>${escapeHtml(f.workflow)}</strong>: ${escapeHtml(f.title)}<br/>Branch: <code>${escapeHtml(f.branch)}</code> · SHA: <code>${sha}</code><br/><a href="${escapeHtml(f.url)}" target="_blank" rel="noreferrer">Open run</a></li>`;
+        }).join('');
+      } catch (err) {
+        statusEl.textContent = 'Request failed. Check server logs.';
+      }
+    }
+
+    loadBtn.addEventListener('click', loadFailures);
+  </script>
 </body>
 </html>
