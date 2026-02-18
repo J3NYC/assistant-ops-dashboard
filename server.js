@@ -505,9 +505,16 @@ function send401(req, res, reason) {
   logAuthFailure(req, reason);
   clearAuthCookies(res);
 
+  const isApiPath = String(req.path || "").startsWith("/api/");
+  const isAuthPath = String(req.path || "").startsWith("/auth/");
+
+  if (req.method === "GET" && !isApiPath && !isAuthPath) {
+    return res.redirect(302, "/login");
+  }
+
   const accept = String(req.headers.accept || "");
   const wantsHtml = accept.includes("text/html");
-  if (req.method === "GET" && wantsHtml) {
+  if (req.method === "GET" && wantsHtml && !isApiPath) {
     return res.redirect(302, "/login");
   }
 
