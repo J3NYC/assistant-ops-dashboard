@@ -21,6 +21,14 @@ const TLS_CIPHERS = [
   "ECDHE-RSA-AES256-GCM-SHA384",
 ].join(":");
 
+const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const ALLOWED_METHODS = String(process.env.ALLOWED_METHODS || "GET,POST,OPTIONS");
+const ALLOWED_HEADERS = String(process.env.ALLOWED_HEADERS || "Authorization,Content-Type");
+const CORS_MAX_AGE_SECONDS = 86400;
+
 const ACCESS_TOKEN_TTL_SECONDS = 15 * 60; // 15 minutes
 const REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
 const SESSION_ABSOLUTE_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24h
@@ -191,6 +199,35 @@ app.use((req, res, next) => {
     res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
   }
   next();
+});
+
+app.use((req, res, next) => {
+  const origin = String(req.headers.origin || "").trim();
+  if (!origin) {
+    if (req.method === "OPTIONS") return res.status(204).end();
+    return next();
+  }
+
+  const matchedOrigin = ALLOWED_ORIGINS.find((o) => o === origin);
+  if (!matchedOrigin) {
+    console.warn(
+      `[cors-rejected] origin=${origin} method=${req.method} path=${req.path} ts=${new Date().toISOString()}`
+    );
+    if (req.method === "OPTIONS") return res.status(204).end();
+    return next();
+  }
+
+  res.setHeader("Access-Control-Allow-Origin", matchedOrigin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", ALLOWED_METHODS);
+  res.setHeader("Access-Control-Allow-Headers", ALLOWED_HEADERS);
+  res.setHeader("Access-Control-Max-Age", String(CORS_MAX_AGE_SECONDS));
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
+  return next();
 });
 
 function run(cmd) {

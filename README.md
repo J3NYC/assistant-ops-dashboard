@@ -55,6 +55,21 @@ This project now runs HTTPS by default with:
   - `Strict-Transport-Security: max-age=31536000; includeSubDomains; preload`
 - Outbound TLS verification enabled (`rejectUnauthorized: true`)
 - Optional certificate pinning via `TLS_PINNED_SPKI_SHA256`
+- Strict dynamic CORS whitelist (no wildcard)
+
+### CORS environment configuration
+
+```bash
+ALLOWED_ORIGINS=https://yourdomain.com,https://app.yourdomain.com
+ALLOWED_METHODS=GET,POST,OPTIONS
+ALLOWED_HEADERS=Authorization,Content-Type
+```
+
+Behavior:
+- Returns a matched origin (never `*`)
+- Returns no CORS headers for unmatched origins
+- Logs rejected origins as `[cors-rejected] ...`
+- Caches preflight for 24h (`Access-Control-Max-Age: 86400`)
 
 ### Local dev run (non-root ports)
 
