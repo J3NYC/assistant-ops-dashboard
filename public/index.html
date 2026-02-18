@@ -29,6 +29,10 @@
       <option value="low">Low</option>
     </select>
     <button id="load">Load failures</button>
+    <button id="export">Export summary</button>
+    <button id="openTop3">Open top 3 high severity</button>
+    <label for="autoRefresh">Auto-refresh</label>
+    <input id="autoRefresh" type="checkbox" />
   </div>
 
   <p id="status"></p>
@@ -38,8 +42,14 @@
     const repoInput = document.getElementById('repo');
     const severityFilter = document.getElementById('severityFilter');
     const loadBtn = document.getElementById('load');
+    const exportBtn = document.getElementById('export');
+    const openTop3Btn = document.getElementById('openTop3');
+    const autoRefreshEl = document.getElementById('autoRefresh');
     const statusEl = document.getElementById('status');
     const resultsEl = document.getElementById('results');
+
+    let latestData = null;
+    let autoRefreshTimer = null;
 
     function escapeHtml(str) {
       return String(str || '')
@@ -48,6 +58,56 @@
         .replaceAll('>', '&gt;')
         .replaceAll('"', '&quot;')
         .replaceAll("'", '&#039;');
+    }
+
+    function getProcessedFailures(data) {
+      const severityOrder = { high: 0, medium: 1, low: 2, unknown: 3 };
+      const selectedSeverity = (severityFilter.value || 'all').toLowerCase();
+      const list = Array.isArray(data?.failures) ? data.failures : [];
+
+      const sorted = [...list].sort((a, b) => {
+        const sa = String(a.severity || 'unknown').toLowerCase();
+        const sb = String(b.severity || 'unknown').toLowerCase();
+        const oa = severityOrder[sa] ?? 99;
+        const ob = severityOrder[sb] ?? 99;
+        if (oa !== ob) return oa - ob;
+        return Number(b.confidence || 0) - Number(a.confidence || 0);
+      });
+
+      const filtered = selectedSeverity === 'all'
+        ? sorted
+        : sorted.filter((f) => String(f.severity || '').toLowerCase() === selectedSeverity);
+
+      return { sorted, filtered };
+    }
+
+    function renderFailures(data) {
+      const { filtered } = getProcessedFailures(data);
+      statusEl.textContent = `${filtered.length} of ${data.count} failed run(s) for ${data.repo}`;
+
+      if (!filtered.length) {
+        resultsEl.innerHTML = '<li>No failed runs match that severity filter.</li>';
+        return;
+      }
+
+      resultsEl.innerHTML = filtered.map((f) => {
+        const sha = escapeHtml((f.sha || '').slice(0, 7));
+        const reason = escapeHtml(f.failureReason || 'Failure reason unavailable');
+        const topFailures = Array.isArray(f.topFailures) ? f.topFailures : [];
+        const topFailuresHtml = topFailures.length
+          ? `<br/>Likely fail points: ${topFailures.map((x) => `${escapeHtml(x.job)} → ${escapeHtml(x.step)}`).join('; ')}`
+          : '';
+        const category = escapeHtml(f.failureCategory || 'unknown');
+        const hint = escapeHtml(f.fixHint || 'No hint available');
+        const confidenceNum = Number(f.confidence || 0);
+        const confidencePct = `${Math.round(confidenceNum * 100)}%`;
+        const severity = (f.severity || 'low').toLowerCase();
+        const severityClass = severity === 'high' ? 'sev-high' : severity === 'medium' ? 'sev-medium' : 'sev-low';
+        const snippet = escapeHtml(f.logSnippet || '').slice(0, 350);
+        const snippetHtml = snippet ? `<br/><details><summary>Failed log excerpt</summary><pre style="white-space: pre-wrap; background: #f8f8f8; padding: 0.5rem; border-radius: 6px;">${snippet}</pre></details>` : '';
+
+        return `<li><strong>${escapeHtml(f.workflow)}</strong>: ${escapeHtml(f.title)}<br/>Branch: <code>${escapeHtml(f.branch)}</code> · SHA: <code>${sha}</code><br/>Why it failed: ${reason}${topFailuresHtml}<br/>Category: <code>${category}</code> · Confidence: <code>${escapeHtml(confidencePct)}</code> · <span class="badge ${severityClass}">${escapeHtml(severity.toUpperCase())}</span><br/>Hint: ${hint}${snippetHtml}<br/><a href="${escapeHtml(f.url)}" target="_blank" rel="noreferrer">Open run</a></li>`;
+      }).join('');
     }
 
     async function loadFailures() {
@@ -68,54 +128,79 @@
           return;
         }
 
-        const severityOrder = { high: 0, medium: 1, low: 2, unknown: 3 };
-        const selectedSeverity = (severityFilter.value || 'all').toLowerCase();
-
-        const sorted = [...data.failures].sort((a, b) => {
-          const sa = String(a.severity || 'unknown').toLowerCase();
-          const sb = String(b.severity || 'unknown').toLowerCase();
-          const oa = severityOrder[sa] ?? 99;
-          const ob = severityOrder[sb] ?? 99;
-          if (oa !== ob) return oa - ob;
-          return Number(b.confidence || 0) - Number(a.confidence || 0);
-        });
-
-        const filtered = selectedSeverity === 'all'
-          ? sorted
-          : sorted.filter((f) => String(f.severity || '').toLowerCase() === selectedSeverity);
-
-        statusEl.textContent = `${filtered.length} of ${data.count} failed run(s) for ${data.repo}`;
-
-        if (!filtered.length) {
-          resultsEl.innerHTML = '<li>No failed runs match that severity filter.</li>';
-          return;
-        }
-
-        resultsEl.innerHTML = filtered.map((f) => {
-          const sha = escapeHtml((f.sha || '').slice(0, 7));
-          const reason = escapeHtml(f.failureReason || 'Failure reason unavailable');
-          const topFailures = Array.isArray(f.topFailures) ? f.topFailures : [];
-          const topFailuresHtml = topFailures.length
-            ? `<br/>Likely fail points: ${topFailures.map((x) => `${escapeHtml(x.job)} → ${escapeHtml(x.step)}`).join('; ')}`
-            : '';
-          const category = escapeHtml(f.failureCategory || 'unknown');
-          const hint = escapeHtml(f.fixHint || 'No hint available');
-          const confidenceNum = Number(f.confidence || 0);
-          const confidencePct = `${Math.round(confidenceNum * 100)}%`;
-          const severity = (f.severity || 'low').toLowerCase();
-          const severityClass = severity === 'high' ? 'sev-high' : severity === 'medium' ? 'sev-medium' : 'sev-low';
-          const snippet = escapeHtml(f.logSnippet || '').slice(0, 350);
-          const snippetHtml = snippet ? `<br/><details><summary>Failed log excerpt</summary><pre style="white-space: pre-wrap; background: #f8f8f8; padding: 0.5rem; border-radius: 6px;">${snippet}</pre></details>` : '';
-
-          return `<li><strong>${escapeHtml(f.workflow)}</strong>: ${escapeHtml(f.title)}<br/>Branch: <code>${escapeHtml(f.branch)}</code> · SHA: <code>${sha}</code><br/>Why it failed: ${reason}${topFailuresHtml}<br/>Category: <code>${category}</code> · Confidence: <code>${escapeHtml(confidencePct)}</code> · <span class="badge ${severityClass}">${escapeHtml(severity.toUpperCase())}</span><br/>Hint: ${hint}${snippetHtml}<br/><a href="${escapeHtml(f.url)}" target="_blank" rel="noreferrer">Open run</a></li>`;
-        }).join('');
+        latestData = data;
+        renderFailures(data);
       } catch (err) {
         statusEl.textContent = 'Request failed. Check server logs.';
       }
     }
 
+    function exportSummary() {
+      if (!latestData) {
+        statusEl.textContent = 'Load failures first, then export.';
+        return;
+      }
+      const { filtered } = getProcessedFailures(latestData);
+      const lines = [
+        `CI Failure Summary`,
+        `Repo: ${latestData.repo}`,
+        `Generated: ${new Date().toISOString()}`,
+        `Visible failures: ${filtered.length}`,
+        ``,
+      ];
+
+      filtered.forEach((f, i) => {
+        lines.push(`${i + 1}. [${String(f.severity || 'unknown').toUpperCase()} ${Math.round(Number(f.confidence || 0) * 100)}%] ${f.workflow} — ${f.title}`);
+        lines.push(`   Branch: ${f.branch}  SHA: ${(f.sha || '').slice(0, 7)}`);
+        lines.push(`   Category: ${f.failureCategory || 'unknown'}`);
+        lines.push(`   Hint: ${f.fixHint || 'No hint available'}`);
+        lines.push(`   URL: ${f.url}`);
+        lines.push('');
+      });
+
+      const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const safeRepo = String(latestData.repo || 'repo').replace('/', '_');
+      a.href = url;
+      a.download = `ci-failure-summary-${safeRepo}.txt`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    function openTop3HighSeverity() {
+      if (!latestData) {
+        statusEl.textContent = 'Load failures first.';
+        return;
+      }
+      const { sorted } = getProcessedFailures(latestData);
+      const top3 = sorted.filter((f) => String(f.severity || '').toLowerCase() === 'high').slice(0, 3);
+      if (!top3.length) {
+        statusEl.textContent = 'No high-severity failures to open.';
+        return;
+      }
+      top3.forEach((f) => window.open(f.url, '_blank', 'noopener,noreferrer'));
+    }
+
+    function toggleAutoRefresh() {
+      if (autoRefreshTimer) {
+        clearInterval(autoRefreshTimer);
+        autoRefreshTimer = null;
+      }
+      if (autoRefreshEl.checked) {
+        autoRefreshTimer = setInterval(() => {
+          if (repoInput.value.trim()) loadFailures();
+        }, 30000);
+      }
+    }
+
     loadBtn.addEventListener('click', loadFailures);
-    severityFilter.addEventListener('change', loadFailures);
+    severityFilter.addEventListener('change', () => {
+      if (latestData) renderFailures(latestData);
+    });
+    exportBtn.addEventListener('click', exportSummary);
+    openTop3Btn.addEventListener('click', openTop3HighSeverity);
+    autoRefreshEl.addEventListener('change', toggleAutoRefresh);
   </script>
 </body>
 </html>
