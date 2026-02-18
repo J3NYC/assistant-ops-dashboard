@@ -40,16 +40,39 @@ A lightweight self-hosted dashboard for monitoring and controlling an OpenClaw a
 - GitHub CLI (`gh`) authenticated with access to target repos
 - OpenClaw installed on host
 
-## Run Locally
+## TLS / HTTPS Hardening (Node.js direct)
+
+This project now runs HTTPS by default with:
+
+- `minVersion: TLSv1.2`
+- TLS 1.2 cipher allowlist:
+  - `ECDHE-ECDSA-AES128-GCM-SHA256`
+  - `ECDHE-RSA-AES128-GCM-SHA256`
+  - `ECDHE-ECDSA-AES256-GCM-SHA384`
+  - `ECDHE-RSA-AES256-GCM-SHA384`
+- HTTP (`:80`) → HTTPS (`:443`) redirect with `301`
+- HSTS header:
+  - `Strict-Transport-Security: max-age=31536000; includeSubDomains; preload`
+- Outbound TLS verification enabled (`rejectUnauthorized: true`)
+- Optional certificate pinning via `TLS_PINNED_SPKI_SHA256`
+
+### Local dev run (non-root ports)
 
 ```bash
 npm install
-npm start
+mkdir -p certs
+openssl req -x509 -newkey rsa:2048 -sha256 -days 30 -nodes \
+  -keyout certs/privkey.pem \
+  -out certs/fullchain.pem \
+  -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+HTTPS_PORT=3443 HTTP_PORT=3080 npm start
 ```
 
 Then open:
 
-- `http://localhost:3000`
+- `https://localhost:3443/login`
 
 ## Screenshot
 
@@ -66,6 +89,23 @@ Then open:
 5. Click **Open top 3 high severity**
 6. Click **Export summary** and show downloaded file
 7. Toggle **Auto-refresh** (30s)
+
+## Automatic certificate renewal (certbot)
+
+Installed and configured with a LaunchAgent:
+
+- `~/Library/LaunchAgents/com.assistant-ops-dashboard.certbot-renew.plist`
+- Script: `scripts/certbot-renew.sh`
+- Schedule: daily at 03:17 local time
+
+Dry-run test command:
+
+```bash
+certbot renew --dry-run \
+  --config-dir ~/.assistant-ops-dashboard/certbot/config \
+  --work-dir ~/.assistant-ops-dashboard/certbot/work \
+  --logs-dir ~/.assistant-ops-dashboard/certbot/logs
+```
 
 ## API Endpoints (high level)
 - `GET /api/health` — OpenClaw status

@@ -3,10 +3,23 @@ const { exec } = require("child_process");
 const path = require("path");
 const crypto = require("crypto");
 const fs = require("fs");
+const http = require("http");
+const https = require("https");
+const tls = require("tls");
 const jwt = require("jsonwebtoken");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const HTTPS_PORT = Number(process.env.HTTPS_PORT || process.env.PORT || 443);
+const HTTP_PORT = Number(process.env.HTTP_PORT || 80);
+const CERT_FILE = process.env.TLS_CERT_PATH || path.join(__dirname, "certs", "fullchain.pem");
+const KEY_FILE = process.env.TLS_KEY_PATH || path.join(__dirname, "certs", "privkey.pem");
+const TLS_MIN_VERSION = "TLSv1.2";
+const TLS_CIPHERS = [
+  "ECDHE-ECDSA-AES128-GCM-SHA256",
+  "ECDHE-RSA-AES128-GCM-SHA256",
+  "ECDHE-ECDSA-AES256-GCM-SHA384",
+  "ECDHE-RSA-AES256-GCM-SHA384",
+].join(":");
 
 const ACCESS_TOKEN_TTL_SECONDS = 15 * 60; // 15 minutes
 const REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
@@ -17,7 +30,6 @@ const MAX_CONCURRENT_SESSIONS = 3;
 const JWT_ISSUER = process.env.JWT_ISSUER || "assistant-ops-dashboard";
 const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "assistant-ops-dashboard-api";
 const COOKIE_DOMAIN = process.env.AUTH_COOKIE_DOMAIN || undefined;
-const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 const JWT_KEY_DIR = path.join(__dirname, "keys");
 const PRIVATE_KEY_PATH = path.join(JWT_KEY_DIR, "jwtRS256.key");
@@ -26,6 +38,37 @@ const PUBLIC_KEY_PATH = path.join(JWT_KEY_DIR, "jwtRS256.key.pub");
 const ACCESS_COOKIE = "ops_access_token";
 const REFRESH_COOKIE = "ops_refresh_token";
 const SESSION_COOKIE = "ops_session_id";
+
+https.globalAgent.options.rejectUnauthorized = true;
+
+const CERT_PIN_MAP = (() => {
+  const raw = process.env.TLS_PINNED_SPKI_SHA256 || "";
+  // Format: host=sha256/base64,host2=sha256/base64
+  const out = new Map();
+  for (const part of raw.split(",").map((s) => s.trim()).filter(Boolean)) {
+    const [host, pin] = part.split("=");
+    if (host && pin) out.set(host.trim().toLowerCase(), pin.trim());
+  }
+  return out;
+})();
+
+function pinnedCheckServerIdentity(hostname, cert) {
+  const defaultErr = tls.checkServerIdentity(hostname, cert);
+  if (defaultErr) return defaultErr;
+
+  const pin = CERT_PIN_MAP.get(String(hostname || "").toLowerCase());
+  if (!pin) return undefined;
+
+  const expected = pin.replace(/^sha256\//, "");
+  const pubkey = cert?.pubkey;
+  if (!pubkey) return new Error(`Pinning failed for ${hostname}: no pubkey available`);
+
+  const actual = crypto.createHash("sha256").update(pubkey).digest("base64");
+  if (actual !== expected) {
+    return new Error(`Pinning failed for ${hostname}: SPKI mismatch`);
+  }
+  return undefined;
+}
 
 const ROLES = {
   owner: {
@@ -142,6 +185,14 @@ const dailyCostStore = new Map();
 
 app.use(express.json());
 
+app.use((req, res, next) => {
+  const proto = req.headers["x-forwarded-proto"] || (req.socket.encrypted ? "https" : "http");
+  if (String(proto).includes("https")) {
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
+  }
+  next();
+});
+
 function run(cmd) {
   return new Promise((resolve) => {
     exec(cmd, { timeout: 8000 }, (err, stdout, stderr) => {
@@ -162,6 +213,29 @@ async function runJson(cmd) {
 
 function isValidRepoName(repo) {
   return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(repo || ""));
+}
+
+function secureHttpsRequest(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(url, {
+      ...options,
+      minVersion: TLS_MIN_VERSION,
+      ciphers: TLS_CIPHERS,
+      honorCipherOrder: false,
+      rejectUnauthorized: true,
+      checkServerIdentity: pinnedCheckServerIdentity,
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (d) => chunks.push(d));
+      res.on("end", () => resolve({
+        statusCode: res.statusCode,
+        headers: res.headers,
+        body: Buffer.concat(chunks).toString("utf8"),
+      }));
+    });
+    req.on("error", reject);
+    req.end();
+  });
 }
 
 function summarizeFailedJobs(runView) {
@@ -305,7 +379,7 @@ function parseCookies(req) {
 function setAuthCookie(res, name, value, maxAgeSeconds) {
   res.cookie(name, value, {
     httpOnly: true,
-    secure: IS_PRODUCTION,
+    secure: true,
     sameSite: "strict",
     path: "/",
     domain: COOKIE_DOMAIN,
@@ -316,7 +390,7 @@ function setAuthCookie(res, name, value, maxAgeSeconds) {
 function clearAuthCookies(res) {
   const opts = {
     httpOnly: true,
-    secure: IS_PRODUCTION,
+    secure: true,
     sameSite: "strict",
     path: "/",
     domain: COOKIE_DOMAIN,
@@ -1077,8 +1151,54 @@ app.get(
   }
 );
 
-app.listen(PORT, () => {
-  console.log(`Dashboard running on http://localhost:${PORT}`);
-  console.log(`JWT key source: ${keyMaterial.source}`);
-  console.log("Public key for verifiers:\n" + keyMaterial.publicKey);
-});
+function loadTlsMaterial() {
+  if (!fs.existsSync(CERT_FILE) || !fs.existsSync(KEY_FILE)) {
+    throw new Error(`TLS certificate files missing. Expected cert=${CERT_FILE} key=${KEY_FILE}`);
+  }
+  return {
+    cert: fs.readFileSync(CERT_FILE, "utf8"),
+    key: fs.readFileSync(KEY_FILE, "utf8"),
+  };
+}
+
+function startServers() {
+  const tlsMaterial = loadTlsMaterial();
+
+  const httpsServer = https.createServer({
+    key: tlsMaterial.key,
+    cert: tlsMaterial.cert,
+    minVersion: TLS_MIN_VERSION,
+    ciphers: TLS_CIPHERS,
+    honorCipherOrder: false,
+    requestCert: false,
+  }, app);
+
+  httpsServer.listen(HTTPS_PORT, () => {
+    console.log(`Dashboard running on https://localhost:${HTTPS_PORT}`);
+    console.log(`TLS minVersion=${TLS_MIN_VERSION}`);
+    console.log(`JWT key source: ${keyMaterial.source}`);
+    console.log("Public key for verifiers:\n" + keyMaterial.publicKey);
+    if (!CERT_PIN_MAP.size) {
+      console.log("TLS pinning map empty (set TLS_PINNED_SPKI_SHA256 to enable host pinning)");
+    }
+  });
+
+  const redirectServer = http.createServer((req, res) => {
+    const host = String(req.headers.host || "localhost").replace(/:\d+$/, "");
+    const portSuffix = HTTPS_PORT === 443 ? "" : `:${HTTPS_PORT}`;
+    const location = `https://${host}${portSuffix}${req.url || "/"}`;
+    res.writeHead(301, { Location: location });
+    res.end();
+  });
+
+  redirectServer.listen(HTTP_PORT, () => {
+    console.log(`HTTP redirect server on http://localhost:${HTTP_PORT} -> https://localhost:${HTTPS_PORT}`);
+  });
+}
+
+try {
+  startServers();
+} catch (err) {
+  console.error("Failed to start TLS servers:", err.message);
+  process.exit(1);
+}
