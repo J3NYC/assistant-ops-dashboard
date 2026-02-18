@@ -9,6 +9,13 @@ const tls = require("tls");
 const net = require("net");
 const jwt = require("jsonwebtoken");
 
+let createRedisClient = null;
+try {
+  ({ createClient: createRedisClient } = require("redis"));
+} catch {
+  createRedisClient = null;
+}
+
 const app = express();
 const HTTPS_PORT = Number(process.env.HTTPS_PORT || process.env.PORT || 443);
 const HTTP_PORT = Number(process.env.HTTP_PORT || 80);
@@ -40,6 +47,15 @@ const WEBHOOK_ALLOWED_IPS = String(process.env.WEBHOOK_ALLOWED_IPS || "")
   .filter(Boolean);
 const WEBHOOK_HMAC_SECRET = String(process.env.WEBHOOK_HMAC_SECRET || "");
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
+
+const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+const REDIS_KEY_PREFIX = process.env.RATE_LIMIT_REDIS_PREFIX || "aod:rl:";
+const INTERNAL_MONITORING_IPS = String(process.env.INTERNAL_MONITORING_IPS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const INTERNAL_MONITORING_HEADER = process.env.INTERNAL_MONITORING_HEADER || "x-internal-monitoring";
+const INTERNAL_MONITORING_HEADER_VALUE = process.env.INTERNAL_MONITORING_HEADER_VALUE || "allow";
 
 const ACCESS_TOKEN_TTL_SECONDS = 15 * 60; // 15 minutes
 const REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
@@ -203,6 +219,191 @@ const refreshTokenStore = new Map(); // hash(token) -> { userId, sessionId, expi
 const rateWindowStore = new Map();
 const dailyCostStore = new Map();
 
+let redisClient = null;
+let redisReady = false;
+
+async function initRedis() {
+  if (!createRedisClient) {
+    console.warn("[rate-limit] redis package not installed; fail-open mode enabled");
+    return;
+  }
+  try {
+    redisClient = createRedisClient({ url: REDIS_URL });
+    redisClient.on("error", (err) => {
+      redisReady = false;
+      console.warn(`[rate-limit] redis error: ${err.message}`);
+    });
+    redisClient.on("ready", () => {
+      redisReady = true;
+      console.log("[rate-limit] redis connected");
+    });
+    await redisClient.connect();
+    redisReady = true;
+  } catch (err) {
+    redisReady = false;
+    console.warn(`[rate-limit] redis unavailable, fail-open mode: ${err.message}`);
+  }
+}
+
+function rlKey(name) {
+  return `${REDIS_KEY_PREFIX}${name}`;
+}
+
+function maskApiKey(key) {
+  const s = String(key || "");
+  return s ? `***${s.slice(-4)}` : "none";
+}
+
+function isInternalMonitoringRequest(req) {
+  const protectedAdminPath = req.path.startsWith("/admin/") || req.path.startsWith("/api/v1/admin/");
+  if (protectedAdminPath) return false;
+  const ipAllowed = INTERNAL_MONITORING_IPS.length && ipMatchesAny(getClientIp(req), INTERNAL_MONITORING_IPS);
+  const headerAllowed = String(req.headers[INTERNAL_MONITORING_HEADER] || "") === INTERNAL_MONITORING_HEADER_VALUE;
+  return Boolean(ipAllowed || headerAllowed);
+}
+
+function shouldBypassIpRateLimit(req) {
+  if (req.path === "/health") return true;
+  if (isInternalMonitoringRequest(req)) return true;
+  return false;
+}
+
+async function redisFailOpen(action, fallback) {
+  if (!redisReady || !redisClient) {
+    return { ok: true, failOpen: true, value: fallback };
+  }
+  try {
+    const value = await action();
+    return { ok: true, failOpen: false, value };
+  } catch (err) {
+    console.warn(`[rate-limit] redis action failed (fail-open): ${err.message}`);
+    return { ok: true, failOpen: true, value: fallback };
+  }
+}
+
+async function ipSlidingWindowCheck(ip, limit = 100, windowMs = 60_000) {
+  const now = Date.now();
+  const key = rlKey(`ip:${ip}:events`);
+  const result = await redisFailOpen(async () => {
+    const minTs = now - windowMs;
+    await redisClient.zRemRangeByScore(key, 0, minTs);
+    await redisClient.zAdd(key, [{ score: now, value: `${now}-${Math.random()}` }]);
+    const count = await redisClient.zCard(key);
+    await redisClient.pExpire(key, windowMs);
+    return Number(count);
+  }, 0);
+
+  if (result.failOpen) return { allowed: true, count: 0, retryAfterSec: 0 };
+  const count = result.value;
+  const allowed = count <= limit;
+  return {
+    allowed,
+    count,
+    retryAfterSec: allowed ? 0 : Math.ceil(windowMs / 1000),
+  };
+}
+
+async function tokenBucketCheck(bucketId, capacity = 60, refillPerSec = 1) {
+  const nowSec = Date.now() / 1000;
+  const key = rlKey(`bucket:${bucketId}`);
+
+  const result = await redisFailOpen(async () => {
+    const arr = await redisClient.hmGet(key, ["tokens", "last"]);
+    let tokens = arr[0] ? Number(arr[0]) : capacity;
+    let last = arr[1] ? Number(arr[1]) : nowSec;
+    const elapsed = Math.max(0, nowSec - last);
+    tokens = Math.min(capacity, tokens + elapsed * refillPerSec);
+
+    if (tokens < 1) {
+      await redisClient.hSet(key, { tokens: String(tokens), last: String(nowSec) });
+      await redisClient.expire(key, 120);
+      return { allowed: false, remaining: Math.floor(tokens), resetSec: Math.ceil((1 - tokens) / refillPerSec) };
+    }
+
+    tokens -= 1;
+    await redisClient.hSet(key, { tokens: String(tokens), last: String(nowSec) });
+    await redisClient.expire(key, 120);
+    return { allowed: true, remaining: Math.floor(tokens), resetSec: Math.ceil((capacity - tokens) / refillPerSec) };
+  }, { allowed: true, remaining: capacity - 1, resetSec: 60 });
+
+  return result.value;
+}
+
+function modelLimitFor(modelName) {
+  const m = String(modelName || "").toLowerCase();
+  if (m.includes("haiku")) return { reqPerMin: 60, tokPerMin: 100_000, name: "haiku" };
+  if (m.includes("sonnet")) return { reqPerMin: 30, tokPerMin: 50_000, name: "sonnet" };
+  if (m.includes("opus")) return { reqPerMin: 10, tokPerMin: 20_000, name: "opus" };
+  return null;
+}
+
+async function modelRateLimitCheck(identity, modelName, estimatedTokens = 0) {
+  const limit = modelLimitFor(modelName);
+  if (!limit) return { allowed: true };
+  const nowMinute = Math.floor(Date.now() / 60000);
+  const reqKey = rlKey(`model:${identity}:${limit.name}:req:${nowMinute}`);
+  const tokKey = rlKey(`model:${identity}:${limit.name}:tok:${nowMinute}`);
+
+  const result = await redisFailOpen(async () => {
+    const reqCount = Number(await redisClient.incr(reqKey));
+    if (reqCount === 1) await redisClient.expire(reqKey, 70);
+
+    const tokCount = Number(await redisClient.incrBy(tokKey, Math.max(0, Number(estimatedTokens || 0))));
+    if (tokCount === Number(estimatedTokens || 0)) await redisClient.expire(tokKey, 70);
+
+    return {
+      allowed: reqCount <= limit.reqPerMin && tokCount <= limit.tokPerMin,
+      reqCount,
+      tokCount,
+      limit,
+    };
+  }, { allowed: true, reqCount: 0, tokCount: 0, limit });
+
+  return result.value;
+}
+
+async function registerRateLimitViolation(ip) {
+  const now = Date.now();
+  const key5 = rlKey(`viol:${ip}:5m`);
+  const key15 = rlKey(`viol:${ip}:15m`);
+  const blockKey = rlKey(`block:${ip}`);
+
+  const result = await redisFailOpen(async () => {
+    await redisClient.zAdd(key5, [{ score: now, value: `${now}-${Math.random()}` }]);
+    await redisClient.zRemRangeByScore(key5, 0, now - 5 * 60_000);
+    await redisClient.pExpire(key5, 5 * 60_000);
+    const hits5 = Number(await redisClient.zCard(key5));
+
+    await redisClient.zAdd(key15, [{ score: now, value: `${now}-${Math.random()}` }]);
+    await redisClient.zRemRangeByScore(key15, 0, now - 15 * 60_000);
+    await redisClient.pExpire(key15, 15 * 60_000);
+    const hits15 = Number(await redisClient.zCard(key15));
+
+    let blockSec = 0;
+    if (hits15 >= 50) {
+      blockSec = 3600;
+      await redisClient.setEx(blockKey, blockSec, "1");
+      console.error(`[rate-limit-alert] ip=${ip} hits15=${hits15} action=block_1h ts=${new Date().toISOString()}`);
+    } else if (hits5 >= 10) {
+      blockSec = 300;
+      await redisClient.setEx(blockKey, blockSec, "1");
+    }
+
+    return { hits5, hits15, blockSec };
+  }, { hits5: 0, hits15: 0, blockSec: 0 });
+
+  return result.value;
+}
+
+async function getIpBlockTtlSec(ip) {
+  const key = rlKey(`block:${ip}`);
+  const result = await redisFailOpen(async () => {
+    const ttl = Number(await redisClient.ttl(key));
+    return ttl > 0 ? ttl : 0;
+  }, 0);
+  return result.value;
+}
+
 app.use((req, res, next) => {
   if (req.path.startsWith("/webhooks/")) return next();
   return express.json()(req, res, next);
@@ -252,6 +453,28 @@ app.use((req, res, next) => {
   }
 
   return next();
+});
+
+app.use(async (req, res, next) => {
+  if (shouldBypassIpRateLimit(req)) return next();
+
+  const clientIp = getClientIp(req);
+  const blockTtl = await getIpBlockTtlSec(clientIp);
+  if (blockTtl > 0) {
+    res.setHeader("Retry-After", String(blockTtl));
+    return res.status(429).json({ error: { message: "Too Many Requests", type: "rate_limited" } });
+  }
+
+  const check = await ipSlidingWindowCheck(clientIp, 100, 60_000);
+  if (check.allowed) return next();
+
+  const escalation = await registerRateLimitViolation(clientIp);
+  const retryAfter = Math.max(check.retryAfterSec, escalation.blockSec || 0, 1);
+  console.warn(
+    `[rate-limit] layer=ip ip=${clientIp} endpoint=${req.path} count=${check.count} limit=100 ts=${new Date().toISOString()}`
+  );
+  res.setHeader("Retry-After", String(retryAfter));
+  return res.status(429).json({ error: { message: "Too Many Requests", type: "rate_limited" } });
 });
 
 app.use((req, res, next) => {
@@ -892,6 +1115,32 @@ function enforceModelAccess(req, res, next) {
   return next();
 }
 
+async function enforceModelRateLimits(req, res, next) {
+  const model = req.body?.model;
+  const estimatedTokens = Number(req.body?.estimatedTokens || req.body?.tokens || 0);
+  const identity = req.auth?.apiKeyId || req.auth?.userId || "anonymous";
+
+  const check = await modelRateLimitCheck(identity, model, estimatedTokens);
+  if (check.allowed) return next();
+
+  const ip = getClientIp(req);
+  const escalation = await registerRateLimitViolation(ip);
+  console.warn(
+    `[rate-limit] layer=model ip=${ip} apiKey=${maskApiKey(req.auth?.apiKeyId)} endpoint=${req.path} count=${check.reqCount}/${check.tokCount} limit=${check.limit.reqPerMin}req/${check.limit.tokPerMin}tok ts=${new Date().toISOString()}`
+  );
+  res.setHeader("Retry-After", String(Math.max(60, escalation.blockSec || 0)));
+  return res.status(429).json({
+    error: { message: "Too Many Requests", type: "rate_limited" },
+    detail: {
+      model: check.limit.name,
+      requestLimitPerMin: check.limit.reqPerMin,
+      tokenLimitPerMin: check.limit.tokPerMin,
+      requestCount: check.reqCount,
+      tokenCount: check.tokCount,
+    },
+  });
+}
+
 app.get("/login", (_req, res) => {
   res.type("html").send(`<!doctype html>
 <html>
@@ -963,6 +1212,29 @@ app.get("/login", (_req, res) => {
 });
 
 app.use(authMiddleware);
+
+app.use(async (req, res, next) => {
+  if (!req.auth) return next();
+
+  const apiKeyId = req.auth.apiKeyId || req.headers["x-api-key-id"] || req.auth.userId;
+  const bucket = await tokenBucketCheck(`api:${apiKeyId}`, 60, 1);
+
+  res.setHeader("X-RateLimit-Limit", "60");
+  res.setHeader("X-RateLimit-Remaining", String(Math.max(0, bucket.remaining)));
+  res.setHeader("X-RateLimit-Reset", String(Math.max(1, bucket.resetSec || 60)));
+
+  if (bucket.allowed) return next();
+
+  const ip = getClientIp(req);
+  const escalation = await registerRateLimitViolation(ip);
+  const retryAfter = Math.max(1, bucket.resetSec || 60, escalation.blockSec || 0);
+  console.warn(
+    `[rate-limit] layer=api_key ip=${ip} apiKey=${maskApiKey(apiKeyId)} endpoint=${req.path} count=${60 - Number(bucket.remaining || 0)} limit=60 ts=${new Date().toISOString()}`
+  );
+  res.setHeader("Retry-After", String(retryAfter));
+  return res.status(429).json({ error: { message: "Too Many Requests", type: "rate_limited" } });
+});
+
 app.use(express.static(path.join(__dirname, "public"), { index: false }));
 
 app.get("/health", (_req, res) => {
@@ -1277,6 +1549,7 @@ app.post(
   requireAnyPermission(["models:all", "models:limited", "models:key-assigned"]),
   enforceRateAndCostLimits("models:invoke", (req) => req.body?.estimatedCost || 0),
   enforceModelAccess,
+  enforceModelRateLimits,
   async (req, res) => {
     return res.json({ ok: true, model: req.body.model, message: "Model call permitted and would execute now." });
   }
@@ -1390,9 +1663,12 @@ function startServers() {
   });
 }
 
-try {
-  startServers();
-} catch (err) {
-  console.error("Failed to start TLS servers:", err.message);
-  process.exit(1);
-}
+(async () => {
+  try {
+    await initRedis();
+    startServers();
+  } catch (err) {
+    console.error("Failed to start TLS servers:", err.message);
+    process.exit(1);
+  }
+})();
