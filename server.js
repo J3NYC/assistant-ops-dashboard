@@ -8,6 +8,7 @@ const https = require("https");
 const tls = require("tls");
 const net = require("net");
 const jwt = require("jsonwebtoken");
+const { encrypt, decrypt, hashSecret, verifySecret } = require("./lib/encryption");
 
 let createRedisClient = null;
 try {
@@ -45,10 +46,19 @@ const WEBHOOK_ALLOWED_IPS = String(process.env.WEBHOOK_ALLOWED_IPS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-const WEBHOOK_HMAC_SECRET = String(process.env.WEBHOOK_HMAC_SECRET || "");
+const WEBHOOK_HMAC_SECRET = (() => {
+  if (ENCRYPTED_WEBHOOK_SECRET) {
+    try {
+      return decrypt(ENCRYPTED_WEBHOOK_SECRET);
+    } catch {
+      return "";
+    }
+  }
+  return String(process.env.WEBHOOK_HMAC_SECRET || "");
+})();
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
-const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+const REDIS_URL = process.env.REDIS_URL || "rediss://127.0.0.1:6379";
 const REDIS_KEY_PREFIX = process.env.RATE_LIMIT_REDIS_PREFIX || "aod:rl:";
 const INTERNAL_MONITORING_IPS = String(process.env.INTERNAL_MONITORING_IPS || "")
   .split(",")
@@ -76,11 +86,19 @@ const LOG_DIR = process.env.LOG_DIR || path.join(__dirname, "logs");
 const SECURITY_LOG_FILE = path.join(LOG_DIR, "security.log.jsonl");
 const GENERAL_LOG_FILE = path.join(LOG_DIR, "app.log.jsonl");
 const LOG_FORWARD_URL = process.env.LOG_FORWARD_URL || "";
+const API_KEY_SECRETS_JSON = process.env.API_KEY_SECRETS_JSON || "{}";
+const ENCRYPTED_WEBHOOK_SECRET = process.env.ENCRYPTED_WEBHOOK_SECRET || "";
 const ADMIN_RECOGNIZED_IPS = String(process.env.ADMIN_RECOGNIZED_IPS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 const LARGE_RESPONSE_BYTES = Number(process.env.LARGE_RESPONSE_BYTES || 200000);
+const PII_REGEX = {
+  ssn: /\b\d{3}-\d{2}-\d{4}\b/g,
+  credit_card: /\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b/g,
+  email: /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi,
+  phone: /\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b/g,
+};
 
 const MAX_INPUT_LENGTH = 4000;
 const MAX_TURNS = 50;
@@ -244,6 +262,29 @@ const usersById = new Map([
 ]);
 const usersByUsername = new Map(Array.from(usersById.values()).map((u) => [u.username, u]));
 
+const apiKeyHashesById = new Map(); // id -> bcrypt hash (no plaintext stored)
+
+async function initializeApiKeyHashes() {
+  let parsed = {};
+  try {
+    parsed = JSON.parse(API_KEY_SECRETS_JSON || "{}");
+  } catch {
+    parsed = {};
+  }
+
+  for (const [apiKeyId, secret] of Object.entries(parsed)) {
+    if (!secret) continue;
+    const hash = await hashSecret(secret);
+    apiKeyHashesById.set(apiKeyId, hash);
+  }
+}
+
+async function verifyApiKeySecret(apiKeyId, candidateSecret) {
+  const hash = apiKeyHashesById.get(String(apiKeyId || ""));
+  if (!hash) return false;
+  return verifySecret(candidateSecret, hash);
+}
+
 const sessionsById = new Map();
 const refreshTokenStore = new Map(); // hash(token) -> { userId, sessionId, expiresAtMs }
 const rateWindowStore = new Map();
@@ -258,7 +299,11 @@ async function initRedis() {
     return;
   }
   try {
-    redisClient = createRedisClient({ url: REDIS_URL });
+    const isRediss = String(REDIS_URL).startsWith("rediss://");
+    redisClient = createRedisClient({
+      url: REDIS_URL,
+      socket: isRediss ? { tls: true, rejectUnauthorized: IS_PRODUCTION } : undefined,
+    });
     redisClient.on("error", (err) => {
       redisReady = false;
       console.warn(`[rate-limit] redis error: ${err.message}`);
@@ -728,11 +773,14 @@ function filterOutputText(text) {
       incidents.push(name);
       out = out.replace(regex, "[REDACTED]");
     }
+    regex.lastIndex = 0;
   };
 
   redact("api_key", /\b(sk-ant-[A-Za-z0-9_-]+|sk-[A-Za-z0-9_-]+)\b/g);
-  redact("pii_ssn", /\b\d{3}-\d{2}-\d{4}\b/g);
-  redact("pii_cc", /\b(?:\d[ -]*?){13,19}\b/g);
+  redact("pii_ssn", PII_REGEX.ssn);
+  redact("pii_cc", PII_REGEX.credit_card);
+  redact("pii_email", PII_REGEX.email);
+  redact("pii_phone", PII_REGEX.phone);
   if (out.includes(CANARY_TOKEN)) {
     incidents.push("canary_leak");
     out = out.replaceAll(CANARY_TOKEN, "[REDACTED_CANARY]");
@@ -758,6 +806,18 @@ async function promptInjectionDefense(req, res, next) {
       endpoint: req.path,
       ip: getClientIp(req),
     });
+  }
+
+  if (req.headers["x-api-key-id"] && req.headers["x-api-key-secret"]) {
+    const ok = await verifyApiKeySecret(String(req.headers["x-api-key-id"]), String(req.headers["x-api-key-secret"]));
+    if (!ok) {
+      structuredLog("critical", "security", "api_key_secret_verification_failed", {
+        api_key: String(req.headers["x-api-key-id"]),
+        endpoint: req.path,
+        ip: getClientIp(req),
+      }, req);
+      return res.status(401).json({ error: { message: "Invalid API key secret", type: "unauthorized" } });
+    }
   }
 
   const blockedState = await getInjectionBlockState(apiKeyId);
@@ -1151,6 +1211,36 @@ function maskUserId(userId) {
   return s.length <= 8 ? s : `***${s.slice(-8)}`;
 }
 
+function detectPii(text) {
+  const s = String(text || "");
+  const detected = [];
+  for (const [k, r] of Object.entries(PII_REGEX)) {
+    if (r.test(s)) detected.push(k);
+    r.lastIndex = 0;
+  }
+  return detected;
+}
+
+function redactPii(text) {
+  let out = String(text || "");
+  for (const r of Object.values(PII_REGEX)) {
+    out = out.replace(r, "[REDACTED_PII]");
+    r.lastIndex = 0;
+  }
+  return out;
+}
+
+function sanitizeMetadata(metadata = {}) {
+  const out = {};
+  for (const [k, v] of Object.entries(metadata || {})) {
+    if (v == null) continue;
+    if (typeof v === "string") out[k] = redactPii(v);
+    else if (Array.isArray(v)) out[k] = v.map((x) => (typeof x === "string" ? redactPii(x) : x));
+    else out[k] = v;
+  }
+  return out;
+}
+
 function appendJsonLog(filePath, entry) {
   try {
     fs.appendFileSync(filePath, `${JSON.stringify(entry)}\n`);
@@ -1178,12 +1268,12 @@ function structuredLog(level, category, event, metadata = {}, req = null) {
     category,
     event,
     request_id: req?.requestId || metadata.request_id || crypto.randomUUID(),
-    metadata: {
+    metadata: sanitizeMetadata({
       ip: metadata.ip || (req ? getClientIp(req) : undefined),
       user_id: maskUserId(metadata.user_id || req?.auth?.userId),
       api_key: maskApiKey(metadata.api_key || req?.auth?.apiKeyId),
       ...metadata,
-    },
+    }),
   };
 
   inMemoryLogs.push(entry);
@@ -1585,6 +1675,12 @@ function purgeExpiredRefreshTokens() {
   const now = Date.now();
   for (const [key, rec] of refreshTokenStore.entries()) {
     if (rec.expiresAtMs <= now) refreshTokenStore.delete(key);
+  }
+}
+
+function purgeExpiredSessions() {
+  for (const [sid, session] of sessionsById.entries()) {
+    if (isSessionExpired(session)) invalidateSession(sid);
   }
 }
 
@@ -2622,10 +2718,16 @@ function startServers() {
   redirectServer.listen(HTTP_PORT, () => {
     console.log(`HTTP redirect server on http://localhost:${HTTP_PORT} -> https://localhost:${HTTPS_PORT}`);
   });
+
+  setInterval(() => {
+    purgeExpiredRefreshTokens();
+    purgeExpiredSessions();
+  }, 24 * 60 * 60 * 1000);
 }
 
 (async () => {
   try {
+    await initializeApiKeyHashes();
     await initRedis();
     startServers();
   } catch (err) {

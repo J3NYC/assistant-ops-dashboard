@@ -95,6 +95,29 @@ INTERNAL_MONITORING_HEADER=x-internal-monitoring
 INTERNAL_MONITORING_HEADER_VALUE=allow
 ```
 
+### Data protection + encryption configuration
+
+```bash
+# 32-byte key (raw/base64/hex) for AES-256-GCM field encryption
+DATA_ENCRYPTION_KEY=...
+
+# Redis over TLS (certificate validation in production)
+REDIS_URL=rediss://redis.example.com:6379
+
+# API key secret material (plaintext only for one-time migration/startup hash)
+API_KEY_SECRETS_JSON={"ak_ops_default":"super-secret"}
+
+# Store encrypted webhook secret (preferred) instead of plaintext WEBHOOK_HMAC_SECRET
+ENCRYPTED_WEBHOOK_SECRET=...
+```
+
+Utilities:
+- `lib/encryption.js` — AES-256-GCM encrypt/decrypt + bcrypt hashing
+- `scripts/migrate-sensitive-data.js` — generate encrypted secrets + hashed API keys
+- `scripts/data-retention.sh` — 7d prompt/response purge, daily session cleanup, 90d analytics anonymization
+- `scripts/backup-encrypted.sh` — encrypted backup (gpg AES256)
+- `scripts/backup-verify.sh` — decrypt/verify backup integrity
+
 Built-in protections on `/api/models/invoke`:
 - Input limits: max 4000 chars, 50 turns, 2000-char system prompt
 - Hard-block jailbreak patterns
