@@ -163,6 +163,41 @@ function isValidRepoName(repo) {
   return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(repo || ""));
 }
 
+function summarizeFailedJobs(runView) {
+  const jobs = Array.isArray(runView?.jobs) ? runView.jobs : [];
+  const failedJobs = jobs.filter((j) => ["failure", "timed_out", "cancelled", "startup_failure", "action_required"].includes(String(j?.conclusion || "").toLowerCase()));
+
+  const failedSteps = [];
+  for (const job of failedJobs) {
+    const steps = Array.isArray(job?.steps) ? job.steps : [];
+    const jobFailedSteps = steps.filter((s) => ["failure", "timed_out", "cancelled"].includes(String(s?.conclusion || "").toLowerCase()));
+    for (const step of jobFailedSteps) {
+      failedSteps.push({
+        job: job?.name || "Unknown job",
+        step: step?.name || "Unknown step",
+        conclusion: step?.conclusion || "failure",
+        number: step?.number,
+      });
+    }
+  }
+
+  const topFailures = failedSteps.slice(0, 3);
+
+  let reason = "Failure reason unavailable from run metadata.";
+  if (topFailures.length > 0) {
+    reason = topFailures.map((f) => `${f.job} → ${f.step} (${f.conclusion})`).join("; ");
+  } else if (failedJobs.length > 0) {
+    reason = failedJobs.slice(0, 2).map((j) => `${j?.name || "Unknown job"} (${j?.conclusion || "failure"})`).join("; ");
+  }
+
+  return {
+    failedJobsCount: failedJobs.length,
+    failedStepsCount: failedSteps.length,
+    topFailures,
+    reason,
+  };
+}
+
 function getClientIp(req) {
   return (
     req.headers["x-forwarded-for"]?.toString().split(",")[0].trim() ||
@@ -738,18 +773,48 @@ app.get(
 
     const failures = Array.isArray(list.data) ? list.data : [];
 
-    const summaries = failures.map((run) => ({
-      runId: run.databaseId,
-      workflow: run.workflowName,
-      title: run.displayTitle,
-      branch: run.headBranch,
-      event: run.event,
-      sha: run.headSha,
-      startedAt: run.startedAt,
-      updatedAt: run.updatedAt,
-      url: run.url,
-      summary: `${run.workflowName || "Workflow"} failed on ${run.headBranch || "unknown-branch"} (${(run.headSha || "").slice(0, 7) || "unknown-sha"})`,
-    }));
+    const summaries = [];
+    for (const run of failures) {
+      const runId = Number(run.databaseId);
+      const base = {
+        runId,
+        workflow: run.workflowName,
+        title: run.displayTitle,
+        branch: run.headBranch,
+        event: run.event,
+        sha: run.headSha,
+        startedAt: run.startedAt,
+        updatedAt: run.updatedAt,
+        url: run.url,
+      };
+
+      const detail = await runJson(
+        `gh run view ${runId} --repo ${repo} --json jobs,url,displayTitle,workflowName,conclusion,status`
+      );
+
+      if (!detail.ok) {
+        summaries.push({
+          ...base,
+          summary: `${run.workflowName || "Workflow"} failed on ${run.headBranch || "unknown-branch"} (${(run.headSha || "").slice(0, 7) || "unknown-sha"})`,
+          failureReason: "Could not fetch job/step details",
+          detailError: detail.error,
+          failedJobsCount: null,
+          failedStepsCount: null,
+          topFailures: [],
+        });
+        continue;
+      }
+
+      const failureDetail = summarizeFailedJobs(detail.data || {});
+      summaries.push({
+        ...base,
+        summary: `${run.workflowName || "Workflow"} failed on ${run.headBranch || "unknown-branch"} (${(run.headSha || "").slice(0, 7) || "unknown-sha"})`,
+        failureReason: failureDetail.reason,
+        failedJobsCount: failureDetail.failedJobsCount,
+        failedStepsCount: failureDetail.failedStepsCount,
+        topFailures: failureDetail.topFailures,
+      });
+    }
 
     return res.json({
       repo,

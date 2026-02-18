@@ -65,7 +65,12 @@
 
         resultsEl.innerHTML = data.failures.map((f) => {
           const sha = escapeHtml((f.sha || '').slice(0, 7));
-          return `<li><strong>${escapeHtml(f.workflow)}</strong>: ${escapeHtml(f.title)}<br/>Branch: <code>${escapeHtml(f.branch)}</code> · SHA: <code>${sha}</code><br/><a href="${escapeHtml(f.url)}" target="_blank" rel="noreferrer">Open run</a></li>`;
+          const reason = escapeHtml(f.failureReason || 'Failure reason unavailable');
+          const topFailures = Array.isArray(f.topFailures) ? f.topFailures : [];
+          const topFailuresHtml = topFailures.length
+            ? `<br/>Likely fail points: ${topFailures.map((x) => `${escapeHtml(x.job)} → ${escapeHtml(x.step)}`).join('; ')}`
+            : '';
+          return `<li><strong>${escapeHtml(f.workflow)}</strong>: ${escapeHtml(f.title)}<br/>Branch: <code>${escapeHtml(f.branch)}</code> · SHA: <code>${sha}</code><br/>Why it failed: ${reason}${topFailuresHtml}<br/><a href="${escapeHtml(f.url)}" target="_blank" rel="noreferrer">Open run</a></li>`;
         }).join('');
       } catch (err) {
         statusEl.textContent = 'Request failed. Check server logs.';
