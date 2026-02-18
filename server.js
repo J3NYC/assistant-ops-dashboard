@@ -57,6 +57,21 @@ const INTERNAL_MONITORING_IPS = String(process.env.INTERNAL_MONITORING_IPS || ""
 const INTERNAL_MONITORING_HEADER = process.env.INTERNAL_MONITORING_HEADER || "x-internal-monitoring";
 const INTERNAL_MONITORING_HEADER_VALUE = process.env.INTERNAL_MONITORING_HEADER_VALUE || "allow";
 
+const CIRCUIT_BREAKER_WEBHOOK = process.env.CIRCUIT_BREAKER_WEBHOOK || "";
+const CIRCUIT_BREAKER_EMAIL = process.env.CIRCUIT_BREAKER_EMAIL || "";
+const DEFAULT_COST_LIMITS = {
+  warning: Number(process.env.CIRCUIT_BREAKER_WARNING || 100),
+  soft: Number(process.env.CIRCUIT_BREAKER_SOFT || 250),
+  hard: Number(process.env.CIRCUIT_BREAKER_HARD || 500),
+  emergency: Number(process.env.CIRCUIT_BREAKER_EMERGENCY || 1000),
+};
+
+const MODEL_COSTS_PER_MILLION = {
+  haiku: { input: 0.25, output: 1.25 },
+  sonnet: { input: 3, output: 15 },
+  opus: { input: 15, output: 75 },
+};
+
 const ACCESS_TOKEN_TTL_SECONDS = 15 * 60; // 15 minutes
 const REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
 const SESSION_ABSOLUTE_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24h
@@ -402,6 +417,161 @@ async function getIpBlockTtlSec(ip) {
     return ttl > 0 ? ttl : 0;
   }, 0);
   return result.value;
+}
+
+function dailyCostDateKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function modelTier(modelName) {
+  const m = String(modelName || "").toLowerCase();
+  if (m.includes("haiku")) return "haiku";
+  if (m.includes("sonnet")) return "sonnet";
+  if (m.includes("opus")) return "opus";
+  return "haiku";
+}
+
+function calculateRequestCost(modelName, inputTokens = 0, outputTokens = 0) {
+  const tier = modelTier(modelName);
+  const rates = MODEL_COSTS_PER_MILLION[tier] || MODEL_COSTS_PER_MILLION.haiku;
+  const inputCost = (Math.max(0, Number(inputTokens || 0)) / 1_000_000) * rates.input;
+  const outputCost = (Math.max(0, Number(outputTokens || 0)) / 1_000_000) * rates.output;
+  return { tier, inputCost, outputCost, totalCost: inputCost + outputCost };
+}
+
+async function getCircuitBreakerLimits() {
+  const key = rlKey("cost:limits");
+  const result = await redisFailOpen(async () => {
+    const raw = await redisClient.get(key);
+    return raw ? JSON.parse(raw) : DEFAULT_COST_LIMITS;
+  }, DEFAULT_COST_LIMITS);
+  return result.value || DEFAULT_COST_LIMITS;
+}
+
+async function setCircuitBreakerLimits(limits) {
+  const key = rlKey("cost:limits");
+  return redisFailOpen(async () => {
+    await redisClient.set(key, JSON.stringify(limits));
+    return true;
+  }, false);
+}
+
+async function isEmergencyManualResetRequired() {
+  const key = rlKey("cost:manual_reset_required");
+  const result = await redisFailOpen(async () => (await redisClient.get(key)) === "1", false);
+  return Boolean(result.value);
+}
+
+async function setEmergencyManualResetRequired(required) {
+  const key = rlKey("cost:manual_reset_required");
+  return redisFailOpen(async () => {
+    if (required) await redisClient.set(key, "1");
+    else await redisClient.del(key);
+    return true;
+  }, false);
+}
+
+async function sendCircuitBreakerAlert(level, message, details = {}) {
+  console.warn(`[circuit-breaker] level=${level} message=${message} details=${JSON.stringify(details)}`);
+  if (!CIRCUIT_BREAKER_WEBHOOK) return;
+  try {
+    const body = JSON.stringify({
+      text: `[${level.toUpperCase()}] ${message}`,
+      details,
+      emailTarget: CIRCUIT_BREAKER_EMAIL || undefined,
+    });
+    await secureHttpsRequest(CIRCUIT_BREAKER_WEBHOOK, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    });
+  } catch (err) {
+    console.warn(`[circuit-breaker] alert send failed: ${err.message}`);
+  }
+}
+
+async function getCostSnapshot() {
+  const day = dailyCostDateKey();
+  const globalKey = rlKey(`cost:day:${day}:global`);
+  const modelKey = rlKey(`cost:day:${day}:model`);
+
+  const result = await redisFailOpen(async () => {
+    const global = Number(await redisClient.get(globalKey) || 0);
+    const byModel = await redisClient.hGetAll(modelKey);
+
+    const userKeys = await redisClient.keys(rlKey(`cost:day:${day}:user:*`));
+    const keyKeys = await redisClient.keys(rlKey(`cost:day:${day}:key:*`));
+
+    const byUser = {};
+    for (const k of userKeys) byUser[k.split(":").at(-1)] = Number(await redisClient.get(k) || 0);
+    const byKey = {};
+    for (const k of keyKeys) byKey[k.split(":").at(-1)] = Number(await redisClient.get(k) || 0);
+
+    return {
+      day,
+      global,
+      byModel: Object.fromEntries(Object.entries(byModel).map(([k, v]) => [k, Number(v)])),
+      byUser,
+      byKey,
+    };
+  }, { day, global: 0, byModel: {}, byUser: {}, byKey: {} });
+
+  return result.value;
+}
+
+async function addCostUsage({ modelName, inputTokens, outputTokens, apiKeyId, userId }) {
+  const day = dailyCostDateKey();
+  const { tier, totalCost } = calculateRequestCost(modelName, inputTokens, outputTokens);
+  const ttl = 24 * 60 * 60;
+
+  const globalKey = rlKey(`cost:day:${day}:global`);
+  const modelKey = rlKey(`cost:day:${day}:model`);
+  const userKey = rlKey(`cost:day:${day}:user:${userId || "unknown"}`);
+  const keyKey = rlKey(`cost:day:${day}:key:${apiKeyId || "none"}`);
+
+  await redisFailOpen(async () => {
+    await redisClient.incrByFloat(globalKey, totalCost);
+    await redisClient.expire(globalKey, ttl);
+    await redisClient.hIncrByFloat(modelKey, tier, totalCost);
+    await redisClient.expire(modelKey, ttl);
+    await redisClient.incrByFloat(userKey, totalCost);
+    await redisClient.expire(userKey, ttl);
+    await redisClient.incrByFloat(keyKey, totalCost);
+    await redisClient.expire(keyKey, ttl);
+    return true;
+  }, false);
+
+  return { tier, totalCost };
+}
+
+async function evaluateCircuitBreaker(modelName) {
+  const limits = await getCircuitBreakerLimits();
+  const snapshot = await getCostSnapshot();
+  const spend = Number(snapshot.global || 0);
+  const manualResetRequired = await isEmergencyManualResetRequired();
+
+  if (manualResetRequired) {
+    return { action: "suspend_all", limits, snapshot, reason: "manual_reset_required" };
+  }
+
+  if (spend >= limits.emergency) {
+    await setEmergencyManualResetRequired(true);
+    await sendCircuitBreakerAlert("emergency", "Emergency cost shutoff triggered", { spend, limits, snapshot });
+    return { action: "suspend_all", limits, snapshot, reason: "emergency" };
+  }
+  if (spend >= limits.hard) {
+    await sendCircuitBreakerAlert("critical", "Hard cost limit reached", { spend, limits, snapshot });
+    if (modelTier(modelName) !== "haiku") return { action: "block_non_haiku", limits, snapshot, reason: "hard" };
+  } else if (spend >= limits.soft) {
+    await sendCircuitBreakerAlert("urgent", "Soft cost limit reached", { spend, limits, snapshot });
+    if (modelTier(modelName) === "opus") return { action: "downgrade_to_sonnet", limits, snapshot, reason: "soft" };
+  } else if (spend >= limits.warning) {
+    await sendCircuitBreakerAlert("warning", "Warning cost threshold reached", { spend, limits, snapshot });
+  }
+
+  return { action: "allow", limits, snapshot, reason: "normal" };
 }
 
 app.use((req, res, next) => {
@@ -1061,6 +1231,12 @@ function requireAnyPermission(actions) {
   };
 }
 
+function requireOwner(req, res, next) {
+  if (req.auth?.role === "owner") return next();
+  logAuthzFailure(req, "owner_only", "owner_required");
+  return res.status(403).json({ error: { message: "Forbidden", type: "forbidden" } });
+}
+
 function enforceRateAndCostLimits(action, resolveEstimatedCost = () => 0) {
   return (req, res, next) => {
     const user = req.user;
@@ -1551,7 +1727,104 @@ app.post(
   enforceModelAccess,
   enforceModelRateLimits,
   async (req, res) => {
-    return res.json({ ok: true, model: req.body.model, message: "Model call permitted and would execute now." });
+    const requestedModel = String(req.body?.model || "haiku");
+    const breaker = await evaluateCircuitBreaker(requestedModel);
+
+    if (breaker.action === "suspend_all") {
+      return res.status(503).json({
+        error: { message: "Service temporarily suspended", type: "service_unavailable" },
+        circuitBreaker: { reason: breaker.reason, spend: breaker.snapshot.global, limits: breaker.limits },
+      });
+    }
+
+    if (breaker.action === "block_non_haiku") {
+      return res.status(503).json({
+        error: { message: "Cost limit reached, only economy model available", type: "service_unavailable" },
+        circuitBreaker: { reason: breaker.reason, spend: breaker.snapshot.global, limits: breaker.limits },
+      });
+    }
+
+    let effectiveModel = requestedModel;
+    let downgraded = false;
+    if (breaker.action === "downgrade_to_sonnet") {
+      effectiveModel = "sonnet";
+      downgraded = true;
+      console.warn(
+        `[circuit-breaker] downgraded request user=${req.auth?.userId} apiKey=${maskApiKey(req.auth?.apiKeyId)} from=${requestedModel} to=sonnet ts=${new Date().toISOString()}`
+      );
+    }
+
+    const inputTokens = Number(req.body?.inputTokens || req.body?.estimatedInputTokens || req.body?.tokens || 0);
+    const outputTokens = Number(req.body?.outputTokens || req.body?.estimatedOutputTokens || 0);
+    const usage = await addCostUsage({
+      modelName: effectiveModel,
+      inputTokens,
+      outputTokens,
+      apiKeyId: req.auth?.apiKeyId || req.headers["x-api-key-id"] || "none",
+      userId: req.auth?.userId || "unknown",
+    });
+
+    return res.json({
+      ok: true,
+      requestedModel,
+      effectiveModel,
+      downgraded,
+      estimatedCostUsd: usage.totalCost,
+      message: "Model call permitted and would execute now.",
+    });
+  }
+);
+
+app.get(
+  "/admin/costs",
+  requirePermission("dashboard:read"),
+  enforceRateAndCostLimits("dashboard:read"),
+  async (_req, res) => {
+    const snapshot = await getCostSnapshot();
+    const limits = await getCircuitBreakerLimits();
+    const state = await evaluateCircuitBreaker("haiku");
+    return res.json({
+      day: snapshot.day,
+      spend: snapshot,
+      limits,
+      breakerState: state.action,
+      reason: state.reason,
+    });
+  }
+);
+
+app.post(
+  "/admin/costs/reset",
+  requireOwner,
+  enforceRateAndCostLimits("users:manage"),
+  async (_req, res) => {
+    const day = dailyCostDateKey();
+    await redisFailOpen(async () => {
+      const keys = await redisClient.keys(rlKey(`cost:day:${day}:*`));
+      if (keys.length) await redisClient.del(keys);
+      await redisClient.del(rlKey("cost:manual_reset_required"));
+      return true;
+    }, false);
+    return res.json({ ok: true, message: "Cost circuit breaker state reset" });
+  }
+);
+
+app.put(
+  "/admin/costs/limits",
+  requireOwner,
+  enforceRateAndCostLimits("users:manage"),
+  async (req, res) => {
+    const nextLimits = {
+      warning: Number(req.body?.warning ?? DEFAULT_COST_LIMITS.warning),
+      soft: Number(req.body?.soft ?? DEFAULT_COST_LIMITS.soft),
+      hard: Number(req.body?.hard ?? DEFAULT_COST_LIMITS.hard),
+      emergency: Number(req.body?.emergency ?? DEFAULT_COST_LIMITS.emergency),
+    };
+    if (!(nextLimits.warning < nextLimits.soft && nextLimits.soft < nextLimits.hard && nextLimits.hard < nextLimits.emergency)) {
+      return res.status(400).json({ error: { message: "Invalid limit ordering", type: "invalid_request" } });
+    }
+    await setCircuitBreakerLimits(nextLimits);
+    return res.json({ ok: true, limits: nextLimits });
   }
 );
 

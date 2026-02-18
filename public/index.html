@@ -38,6 +38,13 @@
   <p id="status"></p>
   <ul id="results"></ul>
 
+  <h2>Daily Spend Circuit Breaker</h2>
+  <p id="costStatus">Loading cost status...</p>
+  <div style="width: 100%; max-width: 640px; background: #eee; border-radius: 8px; overflow: hidden;">
+    <div id="costBar" style="height: 18px; width: 0%; background: #2e7d32;"></div>
+  </div>
+  <p id="costBreakdown"></p>
+
   <script>
     const repoInput = document.getElementById('repo');
     const severityFilter = document.getElementById('severityFilter');
@@ -47,6 +54,9 @@
     const autoRefreshEl = document.getElementById('autoRefresh');
     const statusEl = document.getElementById('status');
     const resultsEl = document.getElementById('results');
+    const costStatusEl = document.getElementById('costStatus');
+    const costBarEl = document.getElementById('costBar');
+    const costBreakdownEl = document.getElementById('costBreakdown');
 
     let latestData = null;
     let autoRefreshTimer = null;
@@ -110,6 +120,36 @@
       }).join('');
     }
 
+    async function loadCosts() {
+      try {
+        const res = await fetch('/admin/costs');
+        if (!res.ok) {
+          costStatusEl.textContent = 'Cost data unavailable';
+          return;
+        }
+        const data = await res.json();
+        const spend = Number(data?.spend?.global || 0);
+        const limits = data?.limits || { warning: 100, soft: 250, hard: 500, emergency: 1000 };
+        const pct = Math.min(100, (spend / limits.emergency) * 100);
+
+        let color = '#2e7d32';
+        if (spend >= limits.emergency) color = '#6a1b9a';
+        else if (spend >= limits.hard) color = '#c62828';
+        else if (spend >= limits.soft) color = '#ef6c00';
+        else if (spend >= limits.warning) color = '#f9a825';
+
+        costBarEl.style.width = `${pct}%`;
+        costBarEl.style.background = color;
+        costStatusEl.textContent = `Spend $${spend.toFixed(2)} / emergency $${Number(limits.emergency).toFixed(2)} (state: ${data.breakerState})`;
+
+        const byModel = data?.spend?.byModel || {};
+        const parts = Object.entries(byModel).map(([k, v]) => `${k}: $${Number(v).toFixed(2)}`);
+        costBreakdownEl.textContent = parts.length ? `By model — ${parts.join(' · ')}` : 'No spend recorded today.';
+      } catch {
+        costStatusEl.textContent = 'Cost data request failed';
+      }
+    }
+
     async function loadFailures() {
       const repo = repoInput.value.trim();
       resultsEl.innerHTML = '';
@@ -130,6 +170,7 @@
 
         latestData = data;
         renderFailures(data);
+        loadCosts();
       } catch (err) {
         statusEl.textContent = 'Request failed. Check server logs.';
       }
@@ -201,6 +242,7 @@
     exportBtn.addEventListener('click', exportSummary);
     openTop3Btn.addEventListener('click', openTop3HighSeverity);
     autoRefreshEl.addEventListener('change', toggleAutoRefresh);
+    loadCosts();
   </script>
 </body>
 </html>

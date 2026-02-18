@@ -73,6 +73,24 @@ WEBHOOK_ALLOWED_IPS=198.51.100.0/24,2001:db8:feed::/48
 WEBHOOK_HMAC_SECRET=replace-with-strong-secret
 ```
 
+### Cost circuit breaker configuration
+
+```bash
+CIRCUIT_BREAKER_WEBHOOK=https://hooks.slack.com/services/xxx
+CIRCUIT_BREAKER_EMAIL=admin@yourdomain.com
+CIRCUIT_BREAKER_WARNING=100
+CIRCUIT_BREAKER_SOFT=250
+CIRCUIT_BREAKER_HARD=500
+CIRCUIT_BREAKER_EMERGENCY=1000
+REDIS_URL=redis://127.0.0.1:6379
+RATE_LIMIT_REDIS_PREFIX=aod:rl:
+```
+
+Admin endpoints:
+- `GET /admin/costs`
+- `POST /admin/costs/reset` (owner only)
+- `PUT /admin/costs/limits` (owner only)
+
 - Admin IP allowlist applies to `/admin/*` and `/api/v1/admin/*`
 - Webhooks require both source IP allowlist match and `x-webhook-signature` HMAC-SHA256 validation
 - In production, `/docs`, `/swagger`, `/api-docs`, `/debug/*`, and `/test/*` are blocked
