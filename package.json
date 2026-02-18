@@ -8,7 +8,8 @@
     "start": "node server.js",
     "test": "echo \"No tests configured\"",
     "security:audit": "npm audit --audit-level=high",
-    "security:check": "npx npm-check-updates"
+    "security:check": "npx npm-check-updates",
+    "security:verify": "npm run security:audit && npm run security:check"
   },
   "keywords": [],
   "author": "",
