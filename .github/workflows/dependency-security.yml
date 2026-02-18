@@ -1,0 +1,108 @@
+name: Dependency Security
+
+on:
+  pull_request:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+
+      - name: Setup Node
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Run high/critical audit gate
+        run: npm audit --audit-level=high
+
+      - name: Export full audit report
+        if: always()
+        run: npm audit --json > audit-report.json || true
+
+      - name: Upload audit artifact
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: audit-report
+          path: audit-report.json
+
+  scheduled-issue:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    needs: audit
+    steps:
+      - name: Checkout
+        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+
+      - name: Setup Node
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Generate audit JSON
+        run: npm audit --json > audit-report.json || true
+
+      - name: Create issue for new vulnerabilities
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('audit-report.json', 'utf8'));
+            const meta = report.metadata?.vulnerabilities || {};
+            const high = Number(meta.high || 0);
+            const critical = Number(meta.critical || 0);
+
+            if ((high + critical) === 0) {
+              core.info('No high/critical vulnerabilities found.');
+              return;
+            }
+
+            const title = `Security: High/Critical npm vulnerabilities detected (${high} high, ${critical} critical)`;
+            const body = [
+              'Automated weekly dependency scan detected vulnerabilities.',
+              '',
+              `- High: ${high}`,
+              `- Critical: ${critical}`,
+              '',
+              'See workflow artifacts for full `audit-report.json`.',
+            ].join('\n');
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'security,dependencies',
+              per_page: 100,
+            });
+
+            const existing = issues.find(i => i.title === title);
+            if (existing) {
+              core.info(`Issue already exists: #${existing.number}`);
+              return;
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['security', 'dependencies'],
+            });

@@ -4,8 +4,11 @@
   "description": "",
   "main": "server.js",
   "scripts": {
+    "preinstall": "npx npm-force-resolutions",
     "start": "node server.js",
-    "test": "echo \"No tests configured\""
+    "test": "echo \"No tests configured\"",
+    "security:audit": "npm audit --audit-level=high",
+    "security:check": "npx npm-check-updates"
   },
   "keywords": [],
   "author": "",
