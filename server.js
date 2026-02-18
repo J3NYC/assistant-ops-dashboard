@@ -655,6 +655,10 @@ function enforceModelAccess(req, res, next) {
   return next();
 }
 
+app.get("/login", (_req, res) => {
+  res.sendFile(path.join(__dirname, "public", "login.html"));
+});
+
 app.use(authMiddleware);
 app.use(express.static(path.join(__dirname, "public"), { index: false }));
 
@@ -800,10 +804,6 @@ app.post("/auth/password", (req, res) => {
   invalidateAllSessionsForUser(user.id);
   clearAuthCookies(res);
   return res.json({ ok: true, message: "Password changed. All sessions invalidated." });
-});
-
-app.get("/login", (_req, res) => {
-  res.sendFile(path.join(__dirname, "public", "login.html"));
 });
 
 app.get(
