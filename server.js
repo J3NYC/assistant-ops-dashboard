@@ -6,6 +6,7 @@ const fs = require("fs");
 const http = require("http");
 const https = require("https");
 const tls = require("tls");
+const net = require("net");
 const jwt = require("jsonwebtoken");
 
 const app = express();
@@ -28,6 +29,17 @@ const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || "")
 const ALLOWED_METHODS = String(process.env.ALLOWED_METHODS || "GET,POST,OPTIONS");
 const ALLOWED_HEADERS = String(process.env.ALLOWED_HEADERS || "Authorization,Content-Type");
 const CORS_MAX_AGE_SECONDS = 86400;
+
+const ADMIN_ALLOWED_IPS = String(process.env.ADMIN_ALLOWED_IPS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const WEBHOOK_ALLOWED_IPS = String(process.env.WEBHOOK_ALLOWED_IPS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const WEBHOOK_HMAC_SECRET = String(process.env.WEBHOOK_HMAC_SECRET || "");
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 const ACCESS_TOKEN_TTL_SECONDS = 15 * 60; // 15 minutes
 const REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
@@ -191,13 +203,25 @@ const refreshTokenStore = new Map(); // hash(token) -> { userId, sessionId, expi
 const rateWindowStore = new Map();
 const dailyCostStore = new Map();
 
-app.use(express.json());
+app.use((req, res, next) => {
+  if (req.path.startsWith("/webhooks/")) return next();
+  return express.json()(req, res, next);
+});
 
 app.use((req, res, next) => {
   const proto = req.headers["x-forwarded-proto"] || (req.socket.encrypted ? "https" : "http");
   if (String(proto).includes("https")) {
     res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
   }
+
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("X-XSS-Protection", "0");
+  res.setHeader("Content-Security-Policy", "default-src 'self'");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+
   next();
 });
 
@@ -228,6 +252,28 @@ app.use((req, res, next) => {
   }
 
   return next();
+});
+
+app.use((req, res, next) => {
+  if (!IS_PRODUCTION) return next();
+  const blockedPrefixes = ["/docs", "/swagger", "/api-docs", "/debug", "/test"];
+  if (blockedPrefixes.some((p) => req.path === p || req.path.startsWith(`${p}/`))) {
+    return res.status(404).json({ error: { message: "Not found", type: "not_found" } });
+  }
+  return next();
+});
+
+app.use((req, res, next) => {
+  const protectedAdminPath = req.path.startsWith("/admin/") || req.path.startsWith("/api/v1/admin/");
+  if (!protectedAdminPath) return next();
+
+  const clientIp = getClientIp(req);
+  if (!ADMIN_ALLOWED_IPS.length || ipMatchesAny(clientIp, ADMIN_ALLOWED_IPS)) return next();
+
+  console.warn(
+    `[ip-blocked] ip=${clientIp} path=${req.path} ts=${new Date().toISOString()}`
+  );
+  return res.status(403).json({ error: { message: "Forbidden", type: "forbidden" } });
 });
 
 function run(cmd) {
@@ -386,6 +432,86 @@ function getClientIp(req) {
 
 function getUserAgent(req) {
   return req.headers["user-agent"] || "unknown";
+}
+
+function normalizeIp(ip) {
+  const raw = String(ip || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("::ffff:")) return raw.slice(7);
+  return raw;
+}
+
+function parseIPv4ToInt(ip) {
+  const parts = ip.split(".").map((p) => Number(p));
+  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+  return ((parts[0] * 256 + parts[1]) * 256 + parts[2]) * 256 + parts[3];
+}
+
+function expandIPv6(ip) {
+  let v = ip.toLowerCase();
+  if (v === "::") return Array(8).fill(0);
+  const hasDouble = v.includes("::");
+  const [leftRaw, rightRaw] = v.split("::");
+  const left = leftRaw ? leftRaw.split(":").filter(Boolean) : [];
+  const right = rightRaw ? rightRaw.split(":").filter(Boolean) : [];
+  if (left.some((x) => x.length > 4) || right.some((x) => x.length > 4)) return null;
+  if (!hasDouble && left.length !== 8) return null;
+  const fillCount = hasDouble ? 8 - (left.length + right.length) : 0;
+  if (fillCount < 0) return null;
+  const full = [...left, ...Array(fillCount).fill("0"), ...right];
+  if (full.length !== 8) return null;
+  const nums = full.map((h) => parseInt(h || "0", 16));
+  if (nums.some((n) => Number.isNaN(n) || n < 0 || n > 0xffff)) return null;
+  return nums;
+}
+
+function parseIPv6ToBigInt(ip) {
+  const parts = expandIPv6(ip);
+  if (!parts) return null;
+  return parts.reduce((acc, part) => (acc << 16n) + BigInt(part), 0n);
+}
+
+function ipInCidr(clientIp, cidr) {
+  const [rangeIpRaw, prefixRaw] = String(cidr || "").split("/");
+  const rangeIp = normalizeIp(rangeIpRaw);
+  const client = normalizeIp(clientIp);
+  const prefix = Number(prefixRaw);
+
+  const rangeType = net.isIP(rangeIp);
+  const clientType = net.isIP(client);
+  if (!rangeType || rangeType !== clientType) return false;
+
+  if (rangeType === 4) {
+    if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) return false;
+    const ipInt = parseIPv4ToInt(client);
+    const rangeInt = parseIPv4ToInt(rangeIp);
+    if (ipInt === null || rangeInt === null) return false;
+    const mask = prefix === 0 ? 0 : (~((1 << (32 - prefix)) - 1)) >>> 0;
+    return (ipInt & mask) === (rangeInt & mask);
+  }
+
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 128) return false;
+  const ipBig = parseIPv6ToBigInt(client);
+  const rangeBig = parseIPv6ToBigInt(rangeIp);
+  if (ipBig === null || rangeBig === null) return false;
+  const hostBits = 128n - BigInt(prefix);
+  const mask = prefix === 0 ? 0n : ((~0n) << hostBits) & ((1n << 128n) - 1n);
+  return (ipBig & mask) === (rangeBig & mask);
+}
+
+function ipMatchesAny(clientIp, rules = []) {
+  const ip = normalizeIp(clientIp);
+  const ipType = net.isIP(ip);
+  if (!ipType) return false;
+
+  return rules.some((rule) => {
+    const r = String(rule || "").trim();
+    if (!r) return false;
+    if (r.includes("/")) return ipInCidr(ip, r);
+    const normalized = normalizeIp(r);
+    if (!net.isIP(normalized)) return false;
+    return normalized === ip;
+  });
 }
 
 function countryBucketFromIp(ip) {
@@ -634,7 +760,7 @@ function send401(req, res, reason) {
 
 function authMiddleware(req, res, next) {
   if (req.method === "GET" && (req.path === "/health" || req.path === "/login")) return next();
-  if (req.method === "POST" && (req.path === "/auth/login" || req.path === "/auth/refresh")) {
+  if (req.method === "POST" && (req.path === "/auth/login" || req.path === "/auth/refresh" || req.path.startsWith("/webhooks/"))) {
     return next();
   }
 
@@ -840,7 +966,35 @@ app.use(authMiddleware);
 app.use(express.static(path.join(__dirname, "public"), { index: false }));
 
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok" });
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+app.post("/webhooks/:source", express.raw({ type: "*/*" }), (req, res) => {
+  const source = req.params.source;
+  const clientIp = getClientIp(req);
+
+  if (WEBHOOK_ALLOWED_IPS.length && !ipMatchesAny(clientIp, WEBHOOK_ALLOWED_IPS)) {
+    console.warn(`[webhook-blocked-ip] source=${source} ip=${clientIp} ts=${new Date().toISOString()}`);
+    return res.status(403).json({ error: { message: "Forbidden", type: "forbidden" } });
+  }
+
+  if (!WEBHOOK_HMAC_SECRET) {
+    console.warn(`[webhook-rejected] source=${source} reason=missing_secret ts=${new Date().toISOString()}`);
+    return res.status(401).json({ error: { message: "Unauthorized", type: "unauthorized" } });
+  }
+
+  const sigHeader = String(req.headers["x-webhook-signature"] || "");
+  const expected = "sha256=" + crypto.createHmac("sha256", WEBHOOK_HMAC_SECRET).update(req.body || Buffer.alloc(0)).digest("hex");
+
+  const sigBuf = Buffer.from(sigHeader);
+  const expBuf = Buffer.from(expected);
+  const valid = sigHeader && sigBuf.length === expBuf.length && crypto.timingSafeEqual(sigBuf, expBuf);
+  if (!valid) {
+    console.warn(`[webhook-rejected] source=${source} reason=bad_signature ip=${clientIp} ts=${new Date().toISOString()}`);
+    return res.status(401).json({ error: { message: "Unauthorized", type: "unauthorized" } });
+  }
+
+  return res.json({ ok: true });
 });
 
 app.post("/auth/login", (req, res) => {
@@ -1002,7 +1156,10 @@ app.get(
   "/api/health",
   requirePermission("dashboard:read"),
   enforceRateAndCostLimits("dashboard:read"),
-  async (_req, res) => {
+  async (req, res) => {
+    if (IS_PRODUCTION && !["owner", "admin"].includes(String(req.auth?.role || ""))) {
+      return res.status(403).json({ error: { message: "Forbidden", type: "forbidden" } });
+    }
     const status = await run("openclaw status");
     res.json({ timestamp: new Date().toISOString(), openclaw: status.ok ? "up" : "down", raw: status.output });
   }

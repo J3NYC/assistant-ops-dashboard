@@ -65,6 +65,18 @@ ALLOWED_METHODS=GET,POST,OPTIONS
 ALLOWED_HEADERS=Authorization,Content-Type
 ```
 
+### IP allowlists and webhook validation
+
+```bash
+ADMIN_ALLOWED_IPS=203.0.113.10,10.8.0.0/24,2001:db8::/48
+WEBHOOK_ALLOWED_IPS=198.51.100.0/24,2001:db8:feed::/48
+WEBHOOK_HMAC_SECRET=replace-with-strong-secret
+```
+
+- Admin IP allowlist applies to `/admin/*` and `/api/v1/admin/*`
+- Webhooks require both source IP allowlist match and `x-webhook-signature` HMAC-SHA256 validation
+- In production, `/docs`, `/swagger`, `/api-docs`, `/debug/*`, and `/test/*` are blocked
+
 Behavior:
 - Returns a matched origin (never `*`)
 - Returns no CORS headers for unmatched origins
