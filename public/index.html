@@ -21,6 +21,13 @@
 
   <div class="row">
     <input id="repo" type="text" placeholder="owner/repo" value="" />
+    <label for="severityFilter">Severity:</label>
+    <select id="severityFilter">
+      <option value="all">All</option>
+      <option value="high">High</option>
+      <option value="medium">Medium</option>
+      <option value="low">Low</option>
+    </select>
     <button id="load">Load failures</button>
   </div>
 
@@ -29,6 +36,7 @@
 
   <script>
     const repoInput = document.getElementById('repo');
+    const severityFilter = document.getElementById('severityFilter');
     const loadBtn = document.getElementById('load');
     const statusEl = document.getElementById('status');
     const resultsEl = document.getElementById('results');
@@ -60,14 +68,30 @@
           return;
         }
 
-        statusEl.textContent = `${data.count} recent failed run(s) for ${data.repo}`;
+        const severityOrder = { high: 0, medium: 1, low: 2, unknown: 3 };
+        const selectedSeverity = (severityFilter.value || 'all').toLowerCase();
 
-        if (!data.failures.length) {
-          resultsEl.innerHTML = '<li>No failed runs found 🎉</li>';
+        const sorted = [...data.failures].sort((a, b) => {
+          const sa = String(a.severity || 'unknown').toLowerCase();
+          const sb = String(b.severity || 'unknown').toLowerCase();
+          const oa = severityOrder[sa] ?? 99;
+          const ob = severityOrder[sb] ?? 99;
+          if (oa !== ob) return oa - ob;
+          return Number(b.confidence || 0) - Number(a.confidence || 0);
+        });
+
+        const filtered = selectedSeverity === 'all'
+          ? sorted
+          : sorted.filter((f) => String(f.severity || '').toLowerCase() === selectedSeverity);
+
+        statusEl.textContent = `${filtered.length} of ${data.count} failed run(s) for ${data.repo}`;
+
+        if (!filtered.length) {
+          resultsEl.innerHTML = '<li>No failed runs match that severity filter.</li>';
           return;
         }
 
-        resultsEl.innerHTML = data.failures.map((f) => {
+        resultsEl.innerHTML = filtered.map((f) => {
           const sha = escapeHtml((f.sha || '').slice(0, 7));
           const reason = escapeHtml(f.failureReason || 'Failure reason unavailable');
           const topFailures = Array.isArray(f.topFailures) ? f.topFailures : [];
@@ -91,6 +115,7 @@
     }
 
     loadBtn.addEventListener('click', loadFailures);
+    severityFilter.addEventListener('change', loadFailures);
   </script>
 </body>
 </html>
