@@ -70,7 +70,12 @@
           const topFailuresHtml = topFailures.length
             ? `<br/>Likely fail points: ${topFailures.map((x) => `${escapeHtml(x.job)} → ${escapeHtml(x.step)}`).join('; ')}`
             : '';
-          return `<li><strong>${escapeHtml(f.workflow)}</strong>: ${escapeHtml(f.title)}<br/>Branch: <code>${escapeHtml(f.branch)}</code> · SHA: <code>${sha}</code><br/>Why it failed: ${reason}${topFailuresHtml}<br/><a href="${escapeHtml(f.url)}" target="_blank" rel="noreferrer">Open run</a></li>`;
+          const category = escapeHtml(f.failureCategory || 'unknown');
+          const hint = escapeHtml(f.fixHint || 'No hint available');
+          const snippet = escapeHtml(f.logSnippet || '').slice(0, 350);
+          const snippetHtml = snippet ? `<br/><details><summary>Failed log excerpt</summary><pre style="white-space: pre-wrap; background: #f8f8f8; padding: 0.5rem; border-radius: 6px;">${snippet}</pre></details>` : '';
+
+          return `<li><strong>${escapeHtml(f.workflow)}</strong>: ${escapeHtml(f.title)}<br/>Branch: <code>${escapeHtml(f.branch)}</code> · SHA: <code>${sha}</code><br/>Why it failed: ${reason}${topFailuresHtml}<br/>Category: <code>${category}</code><br/>Hint: ${hint}${snippetHtml}<br/><a href="${escapeHtml(f.url)}" target="_blank" rel="noreferrer">Open run</a></li>`;
         }).join('');
       } catch (err) {
         statusEl.textContent = 'Request failed. Check server logs.';

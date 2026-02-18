@@ -198,6 +198,57 @@ function summarizeFailedJobs(runView) {
   };
 }
 
+function classifyFailureFromLog(logText = "") {
+  const log = String(logText || "").toLowerCase();
+
+  const categories = [
+    {
+      category: "test_failure",
+      hint: "A test appears to be failing. Re-run locally, inspect the failing test output, and fix assertions or setup.",
+      patterns: ["failing test", "test failed", "jest", "mocha", "vitest", "rspec", "pytest", "assertionerror", "expected", "received"],
+    },
+    {
+      category: "lint_or_typecheck",
+      hint: "Lint/type errors detected. Run lint/typecheck locally and fix violations before pushing.",
+      patterns: ["eslint", "tsc", "type error", "typescript", "prettier", "lint", "flake8", "mypy"],
+    },
+    {
+      category: "dependency_or_build",
+      hint: "Dependency/build issue detected. Verify lockfiles, package versions, and build config.",
+      patterns: ["npm err", "yarn err", "pnpm", "could not resolve", "module not found", "cannot find module", "build failed", "compilation failed"],
+    },
+    {
+      category: "infra_or_flaky",
+      hint: "Likely CI environment/network flake. Retry run and inspect external service health/timeouts.",
+      patterns: ["timed out", "timeout", "econnreset", "502 bad gateway", "503 service unavailable", "network error", "rate limit exceeded", "runner lost communication"],
+    },
+    {
+      category: "auth_or_secrets",
+      hint: "Authentication/secrets issue. Check token scopes, secret names, and expiry/rotation status.",
+      patterns: ["unauthorized", "forbidden", "permission denied", "access denied", "invalid token", "expired token", "secret", "authentication failed", "not authorized"],
+    },
+  ];
+
+  for (const c of categories) {
+    const matched = c.patterns.find((p) => log.includes(p));
+    if (matched) {
+      return { category: c.category, hint: c.hint, matchedPattern: matched };
+    }
+  }
+
+  return {
+    category: "unknown",
+    hint: "No strong signal found. Open failed logs and inspect first error stack trace.",
+    matchedPattern: null,
+  };
+}
+
+function extractLogSnippet(logText = "", maxChars = 500) {
+  const clean = String(logText || "").replace(/\r/g, "").trim();
+  if (!clean) return "";
+  return clean.slice(0, maxChars);
+}
+
 function getClientIp(req) {
   return (
     req.headers["x-forwarded-for"]?.toString().split(",")[0].trim() ||
@@ -806,6 +857,12 @@ app.get(
       }
 
       const failureDetail = summarizeFailedJobs(detail.data || {});
+
+      const failedLog = await run(`gh run view ${runId} --repo ${repo} --log-failed`);
+      const logText = failedLog.ok ? failedLog.output : "";
+      const classification = classifyFailureFromLog(logText);
+      const logSnippet = extractLogSnippet(logText, 600);
+
       summaries.push({
         ...base,
         summary: `${run.workflowName || "Workflow"} failed on ${run.headBranch || "unknown-branch"} (${(run.headSha || "").slice(0, 7) || "unknown-sha"})`,
@@ -813,6 +870,10 @@ app.get(
         failedJobsCount: failureDetail.failedJobsCount,
         failedStepsCount: failureDetail.failedStepsCount,
         topFailures: failureDetail.topFailures,
+        failureCategory: classification.category,
+        fixHint: classification.hint,
+        matchedPattern: classification.matchedPattern,
+        logSnippet,
       });
     }
 
