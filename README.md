@@ -86,6 +86,23 @@ REDIS_URL=redis://127.0.0.1:6379
 RATE_LIMIT_REDIS_PREFIX=aod:rl:
 ```
 
+### Prompt injection defense configuration
+
+```bash
+# Optional monitoring bypass for health/observability
+INTERNAL_MONITORING_IPS=10.0.0.10
+INTERNAL_MONITORING_HEADER=x-internal-monitoring
+INTERNAL_MONITORING_HEADER_VALUE=allow
+```
+
+Built-in protections on `/api/models/invoke`:
+- Input limits: max 4000 chars, 50 turns, 2000-char system prompt
+- Hard-block jailbreak patterns
+- Sanitizes script/SQL/path traversal sequences
+- Quarantine API key after repeated blocked attempts
+- Output redaction for key/PII/system-prompt leakage
+- Canary token leak detection and alert logging
+
 Admin endpoints:
 - `GET /admin/costs`
 - `POST /admin/costs/reset` (owner only)

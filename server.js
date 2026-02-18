@@ -72,6 +72,11 @@ const MODEL_COSTS_PER_MILLION = {
   opus: { input: 15, output: 75 },
 };
 
+const MAX_INPUT_LENGTH = 4000;
+const MAX_TURNS = 50;
+const MAX_SYSTEM_PROMPT_LENGTH = 2000;
+const CANARY_TOKEN = `CANARY_TOKEN_${crypto.randomUUID()}`;
+
 const ACCESS_TOKEN_TTL_SECONDS = 15 * 60; // 15 minutes
 const REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
 const SESSION_ABSOLUTE_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24h
@@ -572,6 +577,146 @@ async function evaluateCircuitBreaker(modelName) {
   }
 
   return { action: "allow", limits, snapshot, reason: "normal" };
+}
+
+const BLOCKED_INJECTION_PATTERNS = [
+  /ignore\s+(all\s+|your\s+|previous\s+)?instructions/i,
+  /reveal\s+your\s+(instructions|config|prompt|system)/i,
+  /act\s+as\s+(an?\s+)?unrestricted/i,
+  /you\s+are\s+now\s+in\s+(developer|dan|jailbreak)\s+mode/i,
+  /ignore\s+everything\s+above/i,
+  /disregard\s+(your\s+|all\s+)?(rules|guidelines|instructions)/i,
+];
+
+const SANITIZE_PATTERNS = [
+  { name: "script", regex: /<script\b[^>]*>[\s\S]*?<\/script>/gi, replacement: "" },
+  { name: "javascript_uri", regex: /javascript:/gi, replacement: "" },
+  { name: "sql_injection", regex: /(\bunion\s+select\b|\bdrop\s+table\b|\bor\s+1=1\b|--|\/\*)/gi, replacement: "" },
+  { name: "path_traversal", regex: /\.\.\//g, replacement: "" },
+];
+
+function collectInputText(payload) {
+  const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+  const messageText = messages.map((m) => String(m?.content || "")).join("\n");
+  const singleInput = String(payload?.input || payload?.prompt || "");
+  return [singleInput, messageText].filter(Boolean).join("\n");
+}
+
+function sanitizeText(input) {
+  let text = String(input || "");
+  const sanitized = [];
+  for (const p of SANITIZE_PATTERNS) {
+    if (p.regex.test(text)) {
+      sanitized.push(p.name);
+      text = text.replace(p.regex, p.replacement);
+    }
+  }
+  return { text, sanitized };
+}
+
+async function registerInjectionAttempt(apiKeyId, req, reason) {
+  const key = apiKeyId || "none";
+  const now = Date.now();
+
+  const result = await redisFailOpen(async () => {
+    const key24 = rlKey(`inj:${key}:24h`);
+    const keyTemp = rlKey(`inj:block:temp:${key}`);
+    const keyPerm = rlKey(`inj:block:perm:${key}`);
+
+    await redisClient.zAdd(key24, [{ score: now, value: `${now}-${Math.random()}` }]);
+    await redisClient.zRemRangeByScore(key24, 0, now - 24 * 60 * 60 * 1000);
+    await redisClient.pExpire(key24, 24 * 60 * 60 * 1000);
+
+    const hits24 = Number(await redisClient.zCard(key24));
+
+    if (hits24 >= 10) {
+      await redisClient.set(keyPerm, "1");
+      await sendCircuitBreakerAlert("critical", "Permanent API key quarantine due to prompt injection", {
+        apiKey: maskApiKey(key),
+        hits24,
+        path: req.path,
+        reason,
+      });
+      return { blocked: "permanent", hits24 };
+    }
+
+    if (hits24 >= 3) {
+      await redisClient.setEx(keyTemp, 15 * 60, "1");
+      return { blocked: "temporary", hits24 };
+    }
+
+    return { blocked: "none", hits24 };
+  }, { blocked: "none", hits24: 1 });
+
+  return result.value;
+}
+
+async function getInjectionBlockState(apiKeyId) {
+  const key = apiKeyId || "none";
+  return redisFailOpen(async () => {
+    const perm = await redisClient.get(rlKey(`inj:block:perm:${key}`));
+    if (perm === "1") return { blocked: true, type: "permanent", retryAfter: null };
+
+    const ttl = Number(await redisClient.ttl(rlKey(`inj:block:temp:${key}`)));
+    if (ttl > 0) return { blocked: true, type: "temporary", retryAfter: ttl };
+    return { blocked: false, type: "none", retryAfter: null };
+  }, { blocked: false, type: "none", retryAfter: null }).then((r) => r.value);
+}
+
+function filterOutputText(text) {
+  let out = String(text || "");
+  const incidents = [];
+
+  const redact = (name, regex) => {
+    if (regex.test(out)) {
+      incidents.push(name);
+      out = out.replace(regex, "[REDACTED]");
+    }
+  };
+
+  redact("api_key", /\b(sk-ant-[A-Za-z0-9_-]+|sk-[A-Za-z0-9_-]+)\b/g);
+  redact("pii_ssn", /\b\d{3}-\d{2}-\d{4}\b/g);
+  redact("pii_cc", /\b(?:\d[ -]*?){13,19}\b/g);
+  if (out.includes(CANARY_TOKEN)) {
+    incidents.push("canary_leak");
+    out = out.replaceAll(CANARY_TOKEN, "[REDACTED_CANARY]");
+  }
+  redact("system_prompt", /system prompt|internal instructions|developer instructions/gi);
+
+  return { text: out, incidents };
+}
+
+async function promptInjectionDefense(req, res, next) {
+  if (req.path !== "/api/models/invoke") return next();
+
+  const apiKeyId = req.auth?.apiKeyId || req.headers["x-api-key-id"] || req.auth?.userId || "none";
+  const blockedState = await getInjectionBlockState(apiKeyId);
+  if (blockedState.blocked) {
+    if (blockedState.retryAfter) res.setHeader("Retry-After", String(blockedState.retryAfter));
+    return res.status(403).json({ error: { message: "API key quarantined", type: "forbidden" } });
+  }
+
+  const inputTextRaw = collectInputText(req.body || {});
+  const inputLength = inputTextRaw.length;
+  const turns = Array.isArray(req.body?.messages) ? req.body.messages.length : 1;
+  const systemPromptLength = String(req.body?.systemPrompt || "").length;
+
+  const blockedPattern = BLOCKED_INJECTION_PATTERNS.find((r) => r.test(inputTextRaw));
+  const { text: sanitizedInput, sanitized } = sanitizeText(inputTextRaw);
+
+  console.info(`[prompt-validation] ip=${getClientIp(req)} apiKey=${maskApiKey(apiKeyId)} path=${req.path} inputLength=${inputLength} turns=${turns} systemPromptLength=${systemPromptLength} sanitized=${sanitized.join(',') || 'none'} blockedPattern=${blockedPattern ? blockedPattern.source : 'none'} ts=${new Date().toISOString()}`);
+
+  if (inputLength > MAX_INPUT_LENGTH || turns > MAX_TURNS || systemPromptLength > MAX_SYSTEM_PROMPT_LENGTH || blockedPattern) {
+    const quarantine = await registerInjectionAttempt(apiKeyId, req, blockedPattern ? blockedPattern.source : "limit_exceeded");
+    console.warn(`[prompt-blocked] ip=${getClientIp(req)} apiKey=${maskApiKey(apiKeyId)} path=${req.path} reason=${blockedPattern ? 'blocked_pattern' : 'limit_exceeded'} quarantine=${quarantine.blocked} ts=${new Date().toISOString()}`);
+    return res.status(400).json({ error: { message: "Prompt rejected by security policy", type: "invalid_request" } });
+  }
+
+  req.body._sanitizedInput = sanitizedInput;
+  req.body._sanitizedPatterns = sanitized;
+  req.body.systemPrompt = `${String(req.body.systemPrompt || "")}\n\nSecurity canary: ${CANARY_TOKEN}`.trim();
+
+  return next();
 }
 
 app.use((req, res, next) => {
@@ -1388,6 +1533,7 @@ app.get("/login", (_req, res) => {
 });
 
 app.use(authMiddleware);
+app.use(promptInjectionDefense);
 
 app.use(async (req, res, next) => {
   if (!req.auth) return next();
@@ -1764,13 +1910,24 @@ app.post(
       userId: req.auth?.userId || "unknown",
     });
 
+    const simulatedModelOutput = `Model call permitted and would execute now.`;
+    const filtered = filterOutputText(simulatedModelOutput);
+    if (filtered.incidents.length) {
+      console.warn(`[output-filter] ip=${getClientIp(req)} apiKey=${maskApiKey(req.auth?.apiKeyId)} incidents=${filtered.incidents.join(',')} ts=${new Date().toISOString()}`);
+      if (filtered.incidents.includes("canary_leak")) {
+        console.error(`[prompt-injection-alert] canary_leaked apiKey=${maskApiKey(req.auth?.apiKeyId)} path=${req.path} ts=${new Date().toISOString()}`);
+      }
+    }
+
     return res.json({
       ok: true,
       requestedModel,
       effectiveModel,
       downgraded,
       estimatedCostUsd: usage.totalCost,
-      message: "Model call permitted and would execute now.",
+      sanitizedInputPatterns: req.body?._sanitizedPatterns || [],
+      message: filtered.text,
+      outputIncidents: filtered.incidents,
     });
   }
 );
