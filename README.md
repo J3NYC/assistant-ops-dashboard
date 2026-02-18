@@ -107,6 +107,57 @@ Admin endpoints:
 - `GET /admin/costs`
 - `POST /admin/costs/reset` (owner only)
 - `PUT /admin/costs/limits` (owner only)
+- `GET /admin/logs` (admin/owner; filter by `category`, `level`, `since`, `until`, `q`)
+- `GET /admin/logs/digest` (daily medium-severity summaries)
+
+### Structured security logging
+
+JSON log schema:
+- `timestamp` (ISO 8601)
+- `level` (`info|warn|error|critical`)
+- `category` (`auth|api|model|admin|security`)
+- `event`
+- `metadata` (masked identifiers)
+- `request_id`
+
+Sensitive data is not logged (passwords/full tokens/full API keys/prompt content).
+
+Environment:
+```bash
+LOG_DIR=/path/to/logs
+LOG_FORWARD_URL=https://logs.example.com/ingest
+ADMIN_RECOGNIZED_IPS=203.0.113.10,10.8.0.0/24
+```
+
+### Alert rules
+
+Critical (immediate):
+- 10+ failed logins from same IP in 5 min
+- circuit breaker emergency
+- unknown API key usage
+- admin action from unrecognized IP
+
+High:
+- 5+ prompt injection attempts from same key
+- cost spike >3x normal hourly
+- error rate >10% over 5 min
+
+Medium (daily digest):
+- rate limit summary by key/IP
+- failed auth summary
+- cost summary by model/key (`/admin/logs/digest`)
+
+### Log rotation
+
+Script: `scripts/log-rotate.sh`
+- rotate daily
+- compress logs older than 1 day
+- retain security logs 365 days
+- retain general logs 30 days
+
+LaunchAgent installed:
+- `~/Library/LaunchAgents/com.assistant-ops-dashboard.log-rotate.plist`
+- runs daily at 00:05
 
 - Admin IP allowlist applies to `/admin/*` and `/api/v1/admin/*`
 - Webhooks require both source IP allowlist match and `x-webhook-signature` HMAC-SHA256 validation

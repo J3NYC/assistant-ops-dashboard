@@ -1,4 +1,5 @@
 node_modules/
 keys/
 certs/
+logs/
 .env
