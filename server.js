@@ -656,7 +656,73 @@ function enforceModelAccess(req, res, next) {
 }
 
 app.get("/login", (_req, res) => {
-  res.sendFile(path.join(__dirname, "public", "login.html"));
+  res.type("html").send(`<!doctype html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Assistant Ops Dashboard Login</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; }
+    .card { max-width: 420px; padding: 1rem; border: 1px solid #ddd; border-radius: 8px; }
+    label { display: block; margin-top: 0.75rem; }
+    input, button { width: 100%; box-sizing: border-box; padding: 0.6rem; margin-top: 0.3rem; }
+    button { margin-top: 1rem; }
+    #msg { margin-top: 0.75rem; color: #b00020; }
+  </style>
+</head>
+<body>
+  <h1>Assistant Ops Dashboard</h1>
+  <div class="card">
+    <h2>Login</h2>
+    <label>Username
+      <input id="username" type="text" autocomplete="username" />
+    </label>
+    <label>Password
+      <input id="password" type="password" autocomplete="current-password" />
+    </label>
+    <button id="loginBtn">Sign in</button>
+    <div id="msg"></div>
+  </div>
+
+  <script>
+    const usernameEl = document.getElementById('username');
+    const passwordEl = document.getElementById('password');
+    const loginBtn = document.getElementById('loginBtn');
+    const msgEl = document.getElementById('msg');
+
+    async function login() {
+      msgEl.textContent = '';
+      const username = usernameEl.value.trim();
+      const password = passwordEl.value;
+      if (!username || !password) {
+        msgEl.textContent = 'Enter username and password.';
+        return;
+      }
+
+      try {
+        const res = await fetch('/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          msgEl.textContent = data?.error?.message || 'Login failed';
+          return;
+        }
+        window.location.href = '/';
+      } catch {
+        msgEl.textContent = 'Request failed. Is the server running?';
+      }
+    }
+
+    loginBtn.addEventListener('click', login);
+    passwordEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') login();
+    });
+  </script>
+</body>
+</html>`);
 });
 
 app.use(authMiddleware);
