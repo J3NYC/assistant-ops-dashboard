@@ -877,7 +877,13 @@ app.get(
   requirePermission("dashboard:read"),
   enforceRateAndCostLimits("dashboard:read"),
   (_req, res) => {
-    res.sendFile(path.join(__dirname, "public", "index.html"));
+    const indexPath = path.join(__dirname, "public", "index.html");
+    try {
+      const html = fs.readFileSync(indexPath, "utf8");
+      return res.type("html").send(html);
+    } catch {
+      return res.status(500).type("text").send(`Dashboard UI not found at ${indexPath}`);
+    }
   }
 );
 
