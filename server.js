@@ -504,11 +504,18 @@ function isSessionExpired(session) {
 function send401(req, res, reason) {
   logAuthFailure(req, reason);
   clearAuthCookies(res);
+
+  const accept = String(req.headers.accept || "");
+  const wantsHtml = accept.includes("text/html");
+  if (req.method === "GET" && wantsHtml) {
+    return res.redirect(302, "/login");
+  }
+
   return res.status(401).json({ error: { message: "Unauthorized", type: "unauthorized" } });
 }
 
 function authMiddleware(req, res, next) {
-  if (req.method === "GET" && req.path === "/health") return next();
+  if (req.method === "GET" && (req.path === "/health" || req.path === "/login")) return next();
   if (req.method === "POST" && (req.path === "/auth/login" || req.path === "/auth/refresh")) {
     return next();
   }
@@ -786,6 +793,10 @@ app.post("/auth/password", (req, res) => {
   invalidateAllSessionsForUser(user.id);
   clearAuthCookies(res);
   return res.json({ ok: true, message: "Password changed. All sessions invalidated." });
+});
+
+app.get("/login", (_req, res) => {
+  res.sendFile(path.join(__dirname, "public", "login.html"));
 });
 
 app.get(
